@@ -10,7 +10,7 @@ from threading import Timer
 
 import gi
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gtk, Gio, Gdk
+from gi.repository import Gtk, Gio, Gdk, GLib
 
 import vlc
 from pydbus import SessionBus
@@ -245,6 +245,12 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def get_name(self):
         return self.name
 
+    def get_event_manager(self):
+        return self.__vlc_widget.player.event_manager()
+
+    def stop(self):
+        self.__vlc_widget.player.stop()
+
     def cleanup(self):
         """Cleanup resources to prevent memory leaks"""
         self.fade.cancel()
@@ -315,13 +321,21 @@ class VideoPlayer(BasePlayer):
         self.is_any_maximized, self.is_any_fullscreen = False, False
         self.is_paused_by_user = False
 
+        # Playlist state
+        self._playlist_index = 0
+        self._playlist_play_count = 0
+        self._playlist_event_attached = False
+
     def new_window(self, gdk_monitor):
         rect = gdk_monitor.get_geometry()
         return PlayerWindow(gdk_monitor.get_model(), rect.width, rect.height, application=self)
 
     def do_activate(self):
         super().do_activate()
-        self.data_source = self.config[CONFIG_KEY_DATA_SOURCE]
+        if self.mode == MODE_PLAYLIST:
+            self._setup_playlist()
+        else:
+            self.data_source = self.config[CONFIG_KEY_DATA_SOURCE]
 
     def _on_monitor_added(self, _, gdk_monitor, *args):
         super()._on_monitor_added(_, gdk_monitor, *args)
@@ -450,7 +464,7 @@ class VideoPlayer(BasePlayer):
             # Only create WindowHandler on X11, not Wayland
             self.window_handler = WindowHandler(self._on_window_state_changed)
 
-        if self.config[CONFIG_KEY_STATIC_WALLPAPER] and self.mode == MODE_VIDEO:
+        if self.config[CONFIG_KEY_STATIC_WALLPAPER] and self.mode in (MODE_VIDEO, MODE_PLAYLIST):
             self.set_static_wallpaper()
         else:
             self.set_original_wallpaper()
@@ -491,6 +505,98 @@ class VideoPlayer(BasePlayer):
             for monitor, window in self.windows.items():
                 window.play_fade(target=self.volume, fade_duration_sec=self.config[CONFIG_KEY_FADE_DURATION_SEC],
                             fade_interval=self.config[CONFIG_KEY_FADE_INTERVAL])
+
+    def _setup_playlist(self):
+        """Initialize and start playlist playback."""
+        playlist = self.config.get(CONFIG_KEY_PLAYLIST, [])
+        if not playlist:
+            logger.warning("[Playlist] Empty playlist, falling back to normal video mode")
+            self.data_source = self.config[CONFIG_KEY_DATA_SOURCE]
+            return
+
+        self._playlist_index = 0
+        self._playlist_play_count = 0
+        self._playlist_play_current()
+
+    def _playlist_play_current(self):
+        """Play the current video in the playlist on all monitors."""
+        playlist = self.config.get(CONFIG_KEY_PLAYLIST, [])
+        if not playlist:
+            return
+
+        video_path = playlist[self._playlist_index]
+        logger.info(f"[Playlist] Playing video {self._playlist_index + 1}/{len(playlist)}: {video_path}")
+
+        self.config[CONFIG_KEY_DATA_SOURCE]['Default'] = video_path
+
+        video_width, video_height = None, None
+        try:
+            dimension = subprocess.check_output([
+                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                '-show_entries', 'stream=width,height', '-of',
+                'csv=s=x:p=0', video_path
+            ], shell=False, encoding='UTF-8').replace('\n', '')
+            parts = dimension.split("x")
+            video_width = int(parts[0])
+            video_height = int(parts[1])
+        except (subprocess.CalledProcessError, IndexError, ValueError):
+            pass
+
+        for monitor, window in self.windows.items():
+            media = window.media_new(video_path)
+            if not monitor.is_primary():
+                media.add_option("no-audio")
+            window.set_media(media)
+            window.set_position(0.0)
+            if video_width and video_height:
+                window.centercrop(video_width, video_height)
+
+        if not self._playlist_event_attached:
+            for monitor, window in self.windows.items():
+                if monitor.is_primary():
+                    em = window.get_event_manager()
+                    em.event_attach(vlc.EventType.MediaPlayerEndReached, self._on_playlist_media_end)
+                    self._playlist_event_attached = True
+                    break
+
+        self.volume = self.config[CONFIG_KEY_VOLUME]
+        self.is_mute = self.config[CONFIG_KEY_MUTE]
+        self.start_playback()
+
+        if not self.active_handler:
+            self.active_handler = ActiveHandler(self._on_active_changed)
+        if not self.window_handler and not is_wayland():
+            self.window_handler = WindowHandler(self._on_window_state_changed)
+
+        if self.config[CONFIG_KEY_STATIC_WALLPAPER]:
+            self.set_static_wallpaper()
+        else:
+            self.set_original_wallpaper()
+
+    def _on_playlist_media_end(self, event):
+        """VLC callback when a video finishes. Runs in VLC thread, dispatches to GTK main thread."""
+        GLib.idle_add(self._playlist_advance)
+
+    def _playlist_advance(self):
+        """Advance the playlist: repeat current video or move to next."""
+        playlist = self.config.get(CONFIG_KEY_PLAYLIST, [])
+        if not playlist:
+            return False
+
+        repeat_count = self.config.get(CONFIG_KEY_PLAYLIST_REPEAT_COUNT, 1)
+        self._playlist_play_count += 1
+        logger.info(f"[Playlist] Play count: {self._playlist_play_count}/{repeat_count}")
+
+        if self._playlist_play_count < repeat_count:
+            for monitor, window in self.windows.items():
+                window.stop()
+                window.play()
+        else:
+            self._playlist_play_count = 0
+            self._playlist_index = (self._playlist_index + 1) % len(playlist)
+            self._playlist_play_current()
+
+        return False
 
     def monitor_sync(self):
         primary_monitor = None

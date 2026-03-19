@@ -462,7 +462,13 @@ class ConfigUtil:
         del config["is_detect_maximized"]
         config['is_mute_when_maximized'] = CONFIG_TEMPLATE[CONFIG_KEY_MUTE_WHEN_MAXIMIZED]
         config['version'] = 4
-        # save config file
+        self.save(config)
+
+    def _migrateV4To5(self, config: dict):
+        logger.debug(f"[Config] Migration from version 4 to 5.")
+        config[CONFIG_KEY_PLAYLIST] = CONFIG_TEMPLATE[CONFIG_KEY_PLAYLIST]
+        config[CONFIG_KEY_PLAYLIST_REPEAT_COUNT] = CONFIG_TEMPLATE[CONFIG_KEY_PLAYLIST_REPEAT_COUNT]
+        config['version'] = 5
         self.save(config)
         
     def _checkMissingMonitors(self, old_config: dict, template: dict):
@@ -510,6 +516,8 @@ class ConfigUtil:
                     # migration to version 4 for data_source type change
                     if config.get("version") <= 3 and CONFIG_VERSION >= 4:
                         self._migrateV3To4(config)
+                    if config.get("version") == 4 and CONFIG_VERSION >= 5:
+                        self._migrateV4To5(config)
                     self._checkDefaultSource(config)
                     self._checkMissingMonitors(config, CONFIG_TEMPLATE)
                     if self._check(config):

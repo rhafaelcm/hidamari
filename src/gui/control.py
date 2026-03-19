@@ -1,3 +1,4 @@
+import json
 import sys
 import logging
 import threading
@@ -144,6 +145,11 @@ class ControlPanel(Gtk.Application):
             ),
             ("about", self.on_about),
             ("quit", self.on_quit),
+            ("playlist_add", self.on_playlist_add),
+            ("playlist_remove", self.on_playlist_remove),
+            ("playlist_move_up", self.on_playlist_move_up),
+            ("playlist_move_down", self.on_playlist_move_down),
+            ("playlist_apply", self.on_playlist_apply),
         ]
 
         for action_name, handler in actions:
@@ -477,6 +483,7 @@ class ControlPanel(Gtk.Application):
 
     def _reload_all_widgets(self):
         self._reload_icon_view()
+        self._setup_playlist_tab()
         self.set_mute_toggle_icon()
         self.set_scale_volume_sensitive()
         self.set_spin_blur_radius_sensitive()
@@ -499,6 +506,141 @@ class ControlPanel(Gtk.Application):
 
         toggle_mute: Gtk.ToggleButton = self.builder.get_object("ToggleAutostart")
         toggle_mute.set_state = self.is_autostart
+
+    def _setup_playlist_tab(self):
+        tree_view: Gtk.TreeView = self.builder.get_object("PlaylistTreeView")
+
+        if not tree_view.get_model():
+            self.playlist_store = Gtk.ListStore(str, str)
+            tree_view.set_model(self.playlist_store)
+
+            renderer_index = Gtk.CellRendererText()
+            col_index = Gtk.TreeViewColumn("#", renderer_index, text=0)
+            col_index.set_min_width(40)
+            tree_view.append_column(col_index)
+
+            renderer_name = Gtk.CellRendererText()
+            col_name = Gtk.TreeViewColumn("Video", renderer_name, text=1)
+            col_name.set_expand(True)
+            tree_view.append_column(col_name)
+
+            saved_playlist = self.config.get(CONFIG_KEY_PLAYLIST, [])
+            for video_path in saved_playlist:
+                self.playlist_store.append([str(len(self.playlist_store) + 1), os.path.basename(video_path)])
+            self._playlist_paths = list(saved_playlist)
+        else:
+            self.playlist_store = tree_view.get_model()
+
+        spin_repeat: Gtk.SpinButton = self.builder.get_object("SpinPlaylistRepeatCount")
+        spin_repeat.set_value(self.config.get(CONFIG_KEY_PLAYLIST_REPEAT_COUNT, 1))
+
+    def _playlist_renumber(self):
+        for i, row in enumerate(self.playlist_store):
+            row[0] = str(i + 1)
+
+    def on_playlist_add(self, *_):
+        available_videos = get_video_paths()
+        if not available_videos:
+            self._show_error("No videos found in Hidamari folder.\nPlease add videos first.")
+            return
+
+        dialog = Gtk.Dialog(
+            title="Add Videos to Playlist",
+            parent=self.window,
+            modal=True,
+            destroy_with_parent=True,
+        )
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_ADD, Gtk.ResponseType.OK)
+        dialog.set_default_size(400, 400)
+
+        content = dialog.get_content_area()
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+
+        list_store = Gtk.ListStore(bool, str, str)
+        for vp in available_videos:
+            list_store.append([False, os.path.basename(vp), vp])
+
+        tree_view = Gtk.TreeView(model=list_store)
+        renderer_toggle = Gtk.CellRendererToggle()
+        renderer_toggle.connect("toggled", lambda widget, path: list_store[path].__setitem__(0, not list_store[path][0]))
+        col_toggle = Gtk.TreeViewColumn("Select", renderer_toggle, active=0)
+        tree_view.append_column(col_toggle)
+
+        renderer_name = Gtk.CellRendererText()
+        col_name = Gtk.TreeViewColumn("Video", renderer_name, text=1)
+        tree_view.append_column(col_name)
+
+        scrolled.add(tree_view)
+        content.pack_start(scrolled, True, True, 8)
+        dialog.show_all()
+
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            for row in list_store:
+                if row[0]:
+                    video_path = row[2]
+                    self._playlist_paths.append(video_path)
+                    self.playlist_store.append([str(len(self.playlist_store) + 1), os.path.basename(video_path)])
+        dialog.destroy()
+
+    def on_playlist_remove(self, *_):
+        tree_view: Gtk.TreeView = self.builder.get_object("PlaylistTreeView")
+        selection = tree_view.get_selection()
+        model, tree_iter = selection.get_selected()
+        if tree_iter is not None:
+            path = model.get_path(tree_iter)
+            index = path.get_indices()[0]
+            model.remove(tree_iter)
+            del self._playlist_paths[index]
+            self._playlist_renumber()
+
+    def on_playlist_move_up(self, *_):
+        tree_view: Gtk.TreeView = self.builder.get_object("PlaylistTreeView")
+        selection = tree_view.get_selection()
+        model, tree_iter = selection.get_selected()
+        if tree_iter is not None:
+            path = model.get_path(tree_iter)
+            index = path.get_indices()[0]
+            if index > 0:
+                prev_iter = model.get_iter(Gtk.TreePath(index - 1))
+                model.swap(tree_iter, prev_iter)
+                self._playlist_paths[index], self._playlist_paths[index - 1] = \
+                    self._playlist_paths[index - 1], self._playlist_paths[index]
+                self._playlist_renumber()
+
+    def on_playlist_move_down(self, *_):
+        tree_view: Gtk.TreeView = self.builder.get_object("PlaylistTreeView")
+        selection = tree_view.get_selection()
+        model, tree_iter = selection.get_selected()
+        if tree_iter is not None:
+            path = model.get_path(tree_iter)
+            index = path.get_indices()[0]
+            if index < len(model) - 1:
+                next_iter = model.get_iter(Gtk.TreePath(index + 1))
+                model.swap(tree_iter, next_iter)
+                self._playlist_paths[index], self._playlist_paths[index + 1] = \
+                    self._playlist_paths[index + 1], self._playlist_paths[index]
+                self._playlist_renumber()
+
+    def on_playlist_apply(self, *_):
+        if not self._playlist_paths:
+            self._show_error("Playlist is empty.\nPlease add videos first.")
+            return
+
+        spin_repeat: Gtk.SpinButton = self.builder.get_object("SpinPlaylistRepeatCount")
+        repeat_count = int(spin_repeat.get_value())
+
+        self.config[CONFIG_KEY_PLAYLIST] = list(self._playlist_paths)
+        self.config[CONFIG_KEY_PLAYLIST_REPEAT_COUNT] = repeat_count
+        self.config[CONFIG_KEY_MODE] = MODE_PLAYLIST
+        self._save_config()
+
+        logger.info(f"[GUI] Playlist applied: {len(self._playlist_paths)} videos, repeat={repeat_count}")
+
+        if self.server is not None:
+            playlist_json = json.dumps(self._playlist_paths)
+            self.server.playlist(playlist_json, repeat_count)
 
     def _reload_icon_view(self, *_):
         self.video_paths = get_video_paths()
