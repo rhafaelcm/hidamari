@@ -642,9 +642,6 @@ class VideoPlayer(BasePlayer):
         self.config[CONFIG_KEY_DATA_SOURCE]['Default'] = video_path
 
         for monitor, window in self.windows.items():
-            window.stop()
-
-        for monitor, window in self.windows.items():
             media = window.media_new(video_path)
             if repeat_count > 1:
                 media.add_option(f":input-repeat={repeat_count - 1}")
