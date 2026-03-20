@@ -50,16 +50,20 @@ class Fade:
     def __init__(self):
         self.timer = None
         self.is_active = False
+        self._cycle_id = 0
 
     def start(self, cur, target, step, fade_interval, update_callback: callable = None,
               complete_callback: callable = None):
-        # Cancel any existing timer first
         self.cancel()
+        self._cycle_id += 1
+        cycle = self._cycle_id
         self.is_active = True
-        self._fade_step(cur, target, step, fade_interval, update_callback, complete_callback)
+        self._fade_step(cycle, cur, target, step, fade_interval, update_callback, complete_callback)
 
-    def _fade_step(self, cur, target, step, fade_interval, update_callback, complete_callback):
-        if not self.is_active:
+    def _fade_step(self, cycle, cur, target, step, fade_interval, update_callback, complete_callback):
+        if not self.is_active or cycle != self._cycle_id:
+            if cycle != self._cycle_id:
+                logger.debug(f"[Fade] Stale cycle {cycle} ignored (current={self._cycle_id})")
             return
             
         new_cur = cur + step
@@ -74,8 +78,8 @@ class Fade:
             if update_callback:
                 update_callback(int(new_cur))
             self.timer = Timer(fade_interval, self._fade_step,
-                               args=[new_cur, target, step, fade_interval, update_callback, complete_callback])
-            self.timer.daemon = True  # Make timer daemon to prevent blocking shutdown
+                               args=[cycle, new_cur, target, step, fade_interval, update_callback, complete_callback])
+            self.timer.daemon = True
             self.timer.start()
 
     def cancel(self):
@@ -184,7 +188,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
         return self.__vlc_widget.instance.media_new(*args)
 
     def set_media(self, *args):
+        old_media = self.__vlc_widget.player.get_media()
         self.__vlc_widget.player.set_media(*args)
+        if old_media is not None:
+            old_media.release()
 
     def set_volume(self, *args):
         self.__vlc_widget.player.audio_set_volume(*args)
@@ -350,6 +357,9 @@ class VideoPlayer(BasePlayer):
         self._playlist_event_attached = False
         self._is_transitioning = False
         self._playlist_wallpaper_set = False
+        self._playlist_dimensions_cache = {}
+        self._media_end_count = 0
+        self._transition_count = 0
 
     def new_window(self, gdk_monitor):
         rect = gdk_monitor.get_geometry()
@@ -531,6 +541,35 @@ class VideoPlayer(BasePlayer):
                 window.play_fade(target=self.volume, fade_duration_sec=self.config[CONFIG_KEY_FADE_DURATION_SEC],
                             fade_interval=self.config[CONFIG_KEY_FADE_INTERVAL])
 
+    def _probe_video_dimensions(self, video_path):
+        """Get video dimensions via ffprobe, returns (width, height) or (None, None)."""
+        try:
+            dimension = subprocess.check_output([
+                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                '-show_entries', 'stream=width,height', '-of',
+                'csv=s=x:p=0', video_path
+            ], shell=False, encoding='UTF-8').replace('\n', '')
+            parts = dimension.split("x")
+            return int(parts[0]), int(parts[1])
+        except (subprocess.CalledProcessError, IndexError, ValueError):
+            return None, None
+
+    def _playlist_health_check(self):
+        """Periodic health check logging for playlist diagnostics."""
+        try:
+            thread_count = threading.active_count()
+            import resource
+            mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            logger.info(
+                f"[Playlist Health] threads={thread_count} mem={mem_mb:.1f}MB "
+                f"index={self._playlist_index} play_count={self._playlist_play_count} "
+                f"transitioning={self._is_transitioning} "
+                f"media_ends={self._media_end_count} transitions={self._transition_count}"
+            )
+        except Exception as e:
+            logger.debug(f"[Playlist Health] Error collecting stats: {e}")
+        return True
+
     def _setup_playlist(self):
         """Initialize and start playlist playback."""
         playlist = self.config.get(CONFIG_KEY_PLAYLIST, [])
@@ -542,6 +581,17 @@ class VideoPlayer(BasePlayer):
         self._playlist_index = 0
         self._playlist_play_count = 0
         self._playlist_wallpaper_set = False
+        self._media_end_count = 0
+        self._transition_count = 0
+
+        self._playlist_dimensions_cache.clear()
+        for video_path in playlist:
+            w, h = self._probe_video_dimensions(video_path)
+            self._playlist_dimensions_cache[video_path] = (w, h)
+        logger.info(f"[Playlist] Pre-cached dimensions for {len(playlist)} videos")
+
+        GLib.timeout_add_seconds(60, self._playlist_health_check)
+
         self._playlist_play_current()
 
     def _playlist_play_current(self):
@@ -555,18 +605,12 @@ class VideoPlayer(BasePlayer):
 
         self.config[CONFIG_KEY_DATA_SOURCE]['Default'] = video_path
 
-        video_width, video_height = None, None
-        try:
-            dimension = subprocess.check_output([
-                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
-                '-show_entries', 'stream=width,height', '-of',
-                'csv=s=x:p=0', video_path
-            ], shell=False, encoding='UTF-8').replace('\n', '')
-            parts = dimension.split("x")
-            video_width = int(parts[0])
-            video_height = int(parts[1])
-        except (subprocess.CalledProcessError, IndexError, ValueError):
-            pass
+        cached = self._playlist_dimensions_cache.get(video_path)
+        if cached:
+            video_width, video_height = cached
+        else:
+            video_width, video_height = self._probe_video_dimensions(video_path)
+            self._playlist_dimensions_cache[video_path] = (video_width, video_height)
 
         for monitor, window in self.windows.items():
             media = window.media_new(video_path)
@@ -603,6 +647,8 @@ class VideoPlayer(BasePlayer):
 
     def _on_playlist_media_end(self, event):
         """VLC callback when a video finishes. Runs in VLC thread, dispatches to GTK main thread."""
+        self._media_end_count += 1
+        logger.info(f"[Playlist] MediaEnd #{self._media_end_count} (transitioning={self._is_transitioning})")
         GLib.idle_add(self._playlist_advance)
 
     def _playlist_advance(self):
@@ -613,7 +659,11 @@ class VideoPlayer(BasePlayer):
 
         repeat_count = self.config.get(CONFIG_KEY_PLAYLIST_REPEAT_COUNT, 1)
         self._playlist_play_count += 1
-        logger.info(f"[Playlist] Play count: {self._playlist_play_count}/{repeat_count}")
+        logger.info(
+            f"[Playlist] Advance: play_count={self._playlist_play_count}/{repeat_count} "
+            f"index={self._playlist_index}/{len(playlist)} "
+            f"transitioning={self._is_transitioning} threads={threading.active_count()}"
+        )
 
         if self._playlist_play_count < repeat_count:
             for monitor, window in self.windows.items():
@@ -629,8 +679,11 @@ class VideoPlayer(BasePlayer):
     def _playlist_transition_to_next(self):
         """Fade out, switch video, then fade in for smooth transition."""
         if self._is_transitioning:
+            logger.warning("[Playlist] Transition skipped: already transitioning")
             return
+        self._transition_count += 1
         self._is_transitioning = True
+        logger.info(f"[Playlist] Transition #{self._transition_count} starting (index={self._playlist_index})")
 
         primary_window = None
         for monitor, window in self.windows.items():
@@ -657,10 +710,15 @@ class VideoPlayer(BasePlayer):
 
     def _playlist_play_current_and_fade_in(self):
         """Load next video and fade windows back in."""
-        self._playlist_play_current()
-        for monitor, window in self.windows.items():
-            window.fade_in_opacity(duration=0.5, interval=0.05)
-        self._is_transitioning = False
+        try:
+            self._playlist_play_current()
+            for monitor, window in self.windows.items():
+                window.fade_in_opacity(duration=0.5, interval=0.05)
+            logger.info(f"[Playlist] Transition #{self._transition_count} complete (index={self._playlist_index})")
+        except Exception as e:
+            logger.error(f"[Playlist] Transition error: {e}", exc_info=True)
+        finally:
+            self._is_transitioning = False
         return False
 
     def monitor_sync(self):
@@ -702,10 +760,10 @@ class VideoPlayer(BasePlayer):
             '-vframes', '1', static_wallpaper_path
         ], shell=False, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         if ret.returncode == 0 and os.path.isfile(static_wallpaper_path):
-            blur_wallpaper = Image.open(static_wallpaper_path)
-            blur_wallpaper = blur_wallpaper.filter(
-                ImageFilter.GaussianBlur(self.config["static_wallpaper_blur_radius"]))
-            blur_wallpaper.save(static_wallpaper_path)
+            with Image.open(static_wallpaper_path) as img:
+                blurred = img.filter(
+                    ImageFilter.GaussianBlur(self.config["static_wallpaper_blur_radius"]))
+                blurred.save(static_wallpaper_path)
             static_wallpaper_uri = pathlib.Path(
                 static_wallpaper_path).resolve().as_uri()
             if is_flatpak():
