@@ -357,6 +357,7 @@ class VideoPlayer(BasePlayer):
         self._is_transitioning = False
         self._playlist_wallpaper_set = False
         self._playlist_dimensions_cache = {}
+        self._last_watchdog_position = -1.0
         self._media_end_count = 0
         self._transition_count = 0
 
@@ -557,10 +558,18 @@ class VideoPlayer(BasePlayer):
         """Periodic health check logging for playlist diagnostics."""
         try:
             thread_count = threading.active_count()
-            import resource
-            mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            mem_mb = 0.0
+            try:
+                with open('/proc/self/status', 'r') as f:
+                    for line in f:
+                        if line.startswith('VmRSS:'):
+                            mem_mb = int(line.split()[1]) / 1024
+                            break
+            except (OSError, ValueError):
+                import resource
+                mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
             logger.info(
-                f"[Playlist Health] threads={thread_count} mem={mem_mb:.1f}MB "
+                f"[Playlist Health] threads={thread_count} rss={mem_mb:.1f}MB "
                 f"index={self._playlist_index} transitioning={self._is_transitioning} "
                 f"media_ends={self._media_end_count} transitions={self._transition_count}"
             )
@@ -585,8 +594,40 @@ class VideoPlayer(BasePlayer):
         logger.info(f"[Playlist] Starting playlist with {len(playlist)} videos")
 
         GLib.timeout_add_seconds(60, self._playlist_health_check)
+        GLib.timeout_add_seconds(30, self._playlist_watchdog)
 
         self._playlist_play_current()
+
+    def _playlist_watchdog(self):
+        """Detect stuck VLC player by checking if playback position progresses."""
+        try:
+            primary_window = None
+            for monitor, window in self.windows.items():
+                if monitor.is_primary():
+                    primary_window = window
+                    break
+            if not primary_window:
+                primary_window = next(iter(self.windows.values()), None)
+            if not primary_window:
+                return True
+
+            current_pos = primary_window.get_position()
+            if self._is_transitioning:
+                self._last_watchdog_position = current_pos
+                return True
+
+            if current_pos == self._last_watchdog_position and current_pos != -1.0:
+                logger.warning(
+                    f"[Playlist Watchdog] Player stuck at position {current_pos:.4f} "
+                    f"index={self._playlist_index}, forcing advance"
+                )
+                self._last_watchdog_position = -1.0
+                self._on_playlist_media_end(None)
+            else:
+                self._last_watchdog_position = current_pos
+        except Exception as e:
+            logger.debug(f"[Playlist Watchdog] Error: {e}")
+        return True
 
     def _playlist_play_current(self):
         """Play the current video in the playlist on all monitors."""
@@ -599,6 +640,9 @@ class VideoPlayer(BasePlayer):
         logger.info(f"[Playlist] Playing video {self._playlist_index + 1}/{len(playlist)} (repeat={repeat_count}x): {video_path}")
 
         self.config[CONFIG_KEY_DATA_SOURCE]['Default'] = video_path
+
+        for monitor, window in self.windows.items():
+            window.stop()
 
         for monitor, window in self.windows.items():
             media = window.media_new(video_path)
