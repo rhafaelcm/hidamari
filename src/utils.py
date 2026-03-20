@@ -488,21 +488,20 @@ class ConfigUtil:
         self.save(config)
         
     def _checkDefaultSource(self, config: dict):
-        # Check if the 'Default' source is empty
-        default_source = config['data_source'].get('Default', '')
         mode = config.get('mode')
+        if mode in (MODE_PLAYLIST, MODE_STREAM, MODE_WEBPAGE):
+            return
+
+        default_source = config['data_source'].get('Default') or ''
         if mode == MODE_VIDEO and not os.path.isfile(default_source):
             logger.warning("[Config] Default source is empty or not a valid file. Setting to the first on available.")
             
-            # Get all values from the 'data_source' dictionary
             values = list(config['data_source'].values())
-            # If there are no values in 'data_source', return early
             if not values:
                 return
             
-            # Set the 'Default' source to the first value available
             for value in values:
-                if len(value) > 0 and os.path.isfile(value):
+                if value and os.path.isfile(value):
                     config['data_source']['Default'] = value
                     self.save(config)
                     break
