@@ -21,12 +21,12 @@ try:
     sys.path.insert(1, os.path.join(sys.path[0], ".."))
     from commons import *
     from monitor import *
-    from gui.gui_utils import get_thumbnail, debounce
+    from gui.gui_utils import get_thumbnail, get_thumbnail_pixbuf, get_video_duration, debounce
     from utils import ConfigUtil, setup_autostart, is_gnome, is_wayland, get_video_paths
 except ModuleNotFoundError:
     from hidamari.monitor import *
     from hidamari.commons import *
-    from hidamari.gui.gui_utils import get_thumbnail, debounce
+    from hidamari.gui.gui_utils import get_thumbnail, get_thumbnail_pixbuf, get_video_duration, debounce
     from hidamari.utils import (
         ConfigUtil,
         setup_autostart,
@@ -155,6 +155,7 @@ class ControlPanel(Gtk.Application):
             ),
             ("about", self.on_about),
             ("quit", self.on_quit),
+            ("add_all_to_playlist", self.on_add_all_to_playlist),
             ("playlist_remove", self.on_playlist_remove),
             ("playlist_move_up", self.on_playlist_move_up),
             ("playlist_move_down", self.on_playlist_move_down),
@@ -523,24 +524,48 @@ class ControlPanel(Gtk.Application):
             self._ensure_playlist_store()
             tree_view.set_model(self.playlist_store)
 
+            renderer_thumb = Gtk.CellRendererPixbuf()
+            col_thumb = Gtk.TreeViewColumn("", renderer_thumb, pixbuf=0)
+            col_thumb.set_min_width(56)
+            tree_view.append_column(col_thumb)
+
             renderer_index = Gtk.CellRendererText()
-            col_index = Gtk.TreeViewColumn("#", renderer_index, text=0)
+            col_index = Gtk.TreeViewColumn("#", renderer_index, text=1)
             col_index.set_min_width(40)
             tree_view.append_column(col_index)
 
             renderer_name = Gtk.CellRendererText()
-            col_name = Gtk.TreeViewColumn("Video", renderer_name, text=1)
+            col_name = Gtk.TreeViewColumn("Video", renderer_name, text=2)
             col_name.set_expand(True)
             tree_view.append_column(col_name)
+
+            renderer_duration = Gtk.CellRendererText()
+            col_duration = Gtk.TreeViewColumn("Duration", renderer_duration, text=3)
+            col_duration.set_min_width(70)
+            tree_view.append_column(col_duration)
 
         spin_repeat: Gtk.SpinButton = self.builder.get_object("SpinPlaylistRepeatCount")
         spin_repeat.set_value(self.config.get(CONFIG_KEY_PLAYLIST_REPEAT_COUNT, 1))
 
     def _ensure_playlist_store(self):
         if self.playlist_store is None:
-            self.playlist_store = Gtk.ListStore(str, str)
-            for vp in self._playlist_paths:
-                self.playlist_store.append([str(len(self.playlist_store) + 1), os.path.basename(vp)])
+            self.playlist_store = Gtk.ListStore(GdkPixbuf.Pixbuf, str, str, str)
+            generic_icon = Gtk.IconTheme.get_default().load_icon("video-x-generic", 48, 0)
+            for idx, vp in enumerate(self._playlist_paths):
+                duration = get_video_duration(vp)
+                self.playlist_store.append([generic_icon, str(idx + 1), os.path.basename(vp), duration])
+                thread = threading.Thread(
+                    target=self._load_playlist_thumbnail, args=(vp, idx))
+                thread.daemon = True
+                thread.start()
+
+    def _load_playlist_thumbnail(self, video_path, idx):
+        pixbuf = get_thumbnail_pixbuf(video_path, size=48)
+        if pixbuf is not None and self.playlist_store is not None:
+            try:
+                self.playlist_store[idx][0] = pixbuf
+            except (IndexError, ValueError):
+                pass
 
     def on_add_to_playlist_context(self, *_):
         selected = self.icon_view.get_selected_items()
@@ -555,12 +580,38 @@ class ControlPanel(Gtk.Application):
 
         self._ensure_playlist_store()
         self._playlist_paths.append(video_path)
-        self.playlist_store.append([str(len(self.playlist_store) + 1), os.path.basename(video_path)])
+        generic_icon = Gtk.IconTheme.get_default().load_icon("video-x-generic", 48, 0)
+        duration = get_video_duration(video_path)
+        new_idx = len(self.playlist_store)
+        self.playlist_store.append([generic_icon, str(new_idx + 1), os.path.basename(video_path), duration])
+        thread = threading.Thread(
+            target=self._load_playlist_thumbnail, args=(video_path, new_idx))
+        thread.daemon = True
+        thread.start()
         logger.info(f"[GUI] Added to playlist: {video_path}")
+
+    def on_add_all_to_playlist(self, *_):
+        if not self.video_paths:
+            return
+        self._ensure_playlist_store()
+        generic_icon = Gtk.IconTheme.get_default().load_icon("video-x-generic", 48, 0)
+        added = 0
+        for video_path in self.video_paths:
+            if video_path not in self._playlist_paths:
+                self._playlist_paths.append(video_path)
+                duration = get_video_duration(video_path)
+                new_idx = len(self.playlist_store)
+                self.playlist_store.append([generic_icon, str(new_idx + 1), os.path.basename(video_path), duration])
+                thread = threading.Thread(
+                    target=self._load_playlist_thumbnail, args=(video_path, new_idx))
+                thread.daemon = True
+                thread.start()
+                added += 1
+        logger.info(f"[GUI] Added {added} videos to playlist")
 
     def _playlist_renumber(self):
         for i, row in enumerate(self.playlist_store):
-            row[0] = str(i + 1)
+            row[1] = str(i + 1)
 
     def on_playlist_remove(self, *_):
         tree_view: Gtk.TreeView = self.builder.get_object("PlaylistTreeView")
@@ -632,10 +683,19 @@ class ControlPanel(Gtk.Application):
             pixbuf = Gtk.IconTheme().get_default().load_icon("video-x-generic", 96, 0)
             list_store.append([pixbuf, os.path.basename(video_path)])
             thread = threading.Thread(
-                target=get_thumbnail, args=(video_path, list_store, idx)
+                target=self._load_icon_view_item, args=(video_path, list_store, idx)
             )
             thread.daemon = True
             thread.start()
+
+    def _load_icon_view_item(self, video_path, list_store, idx):
+        get_thumbnail(video_path, list_store, idx)
+        duration = get_video_duration(video_path)
+        try:
+            name = os.path.basename(video_path)
+            list_store[idx][1] = f"{name}\n{duration}"
+        except (IndexError, ValueError):
+            pass
 
 
 def main(

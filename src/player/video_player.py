@@ -142,6 +142,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
         # A timer that handling fade-in/out
         self.fade = Fade()
+        self.fade_opacity = Fade()
 
         self.menu = None
         self.connect("button-press-event", self._on_button_press_event)
@@ -251,9 +252,30 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def stop(self):
         self.__vlc_widget.player.stop()
 
+    def fade_out_opacity(self, duration=0.5, interval=0.05, callback=None):
+        cur = int(self.get_opacity() * 100)
+        target = 0
+        step = (target - cur) / max(duration / interval, 1)
+        self.fade_opacity.cancel()
+        self.fade_opacity.start(
+            cur=cur, target=target, step=step, fade_interval=interval,
+            update_callback=lambda v: GLib.idle_add(self.set_opacity, max(v / 100.0, 0.0)),
+            complete_callback=callback)
+
+    def fade_in_opacity(self, duration=0.5, interval=0.05, callback=None):
+        cur = int(self.get_opacity() * 100)
+        target = 100
+        step = (target - cur) / max(duration / interval, 1)
+        self.fade_opacity.cancel()
+        self.fade_opacity.start(
+            cur=cur, target=target, step=step, fade_interval=interval,
+            update_callback=lambda v: GLib.idle_add(self.set_opacity, min(v / 100.0, 1.0)),
+            complete_callback=callback)
+
     def cleanup(self):
         """Cleanup resources to prevent memory leaks"""
         self.fade.cancel()
+        self.fade_opacity.cancel()
         if self.__vlc_widget:
             self.__vlc_widget.cleanup()
 
@@ -594,8 +616,39 @@ class VideoPlayer(BasePlayer):
         else:
             self._playlist_play_count = 0
             self._playlist_index = (self._playlist_index + 1) % len(playlist)
-            self._playlist_play_current()
+            self._playlist_transition_to_next()
 
+        return False
+
+    def _playlist_transition_to_next(self):
+        """Fade out, switch video, then fade in for smooth transition."""
+        primary_window = None
+        for monitor, window in self.windows.items():
+            if monitor.is_primary():
+                primary_window = window
+                break
+
+        if not primary_window:
+            primary_window = next(iter(self.windows.values()), None)
+
+        if not primary_window:
+            self._playlist_play_current()
+            return
+
+        def on_fade_out_complete():
+            GLib.idle_add(self._playlist_play_current_and_fade_in)
+
+        for monitor, window in self.windows.items():
+            is_last = (window == primary_window)
+            window.fade_out_opacity(
+                duration=0.5, interval=0.05,
+                callback=on_fade_out_complete if is_last else None)
+
+    def _playlist_play_current_and_fade_in(self):
+        """Load next video and fade windows back in."""
+        self._playlist_play_current()
+        for monitor, window in self.windows.items():
+            window.fade_in_opacity(duration=0.5, interval=0.05)
         return False
 
     def monitor_sync(self):
