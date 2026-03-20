@@ -722,7 +722,7 @@ class VideoPlayer(BasePlayer):
         return False
 
     def _playlist_transition_to_next(self):
-        """Fade out, switch video, then fade in for smooth transition."""
+        """Switch to the next video instantly (no fade effect)."""
         if self._is_transitioning:
             logger.warning("[Playlist] Transition skipped: already transitioning")
             return
@@ -730,41 +730,14 @@ class VideoPlayer(BasePlayer):
         self._is_transitioning = True
         logger.info(f"[Playlist] Transition #{self._transition_count} starting (index={self._playlist_index})")
 
-        primary_window = None
-        for monitor, window in self.windows.items():
-            if monitor.is_primary():
-                primary_window = window
-                break
-
-        if not primary_window:
-            primary_window = next(iter(self.windows.values()), None)
-
-        if not primary_window:
-            self._playlist_play_current()
-            self._is_transitioning = False
-            return
-
-        def on_fade_out_complete():
-            GLib.idle_add(self._playlist_play_current_and_fade_in)
-
-        for monitor, window in self.windows.items():
-            is_last = (window == primary_window)
-            window.fade_out_opacity(
-                duration=0.5, interval=0.05,
-                callback=on_fade_out_complete if is_last else None)
-
-    def _playlist_play_current_and_fade_in(self):
-        """Load next video and fade windows back in."""
         try:
             self._playlist_play_current()
-            for monitor, window in self.windows.items():
-                window.fade_in_opacity(duration=0.5, interval=0.05)
             logger.info(f"[Playlist] Transition #{self._transition_count} complete (index={self._playlist_index})")
         except Exception as e:
             logger.error(f"[Playlist] Transition error: {e}", exc_info=True)
         finally:
             self._is_transitioning = False
-        return False
+
 
     def monitor_sync(self):
         primary_monitor = None
