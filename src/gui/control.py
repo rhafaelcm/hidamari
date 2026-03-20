@@ -217,6 +217,18 @@ class ControlPanel(Gtk.Application):
             self.window.set_position(Gtk.WindowPosition.CENTER)
         self.window.present()
 
+        mode = self.config.get(CONFIG_KEY_MODE, MODE_NULL)
+        stack = self.builder.get_object("stack1")
+        mode_to_tab = {
+            MODE_VIDEO: "video",
+            MODE_PLAYLIST: "playlist",
+            MODE_STREAM: "stream",
+            MODE_WEBPAGE: "webpage",
+        }
+        tab_name = mode_to_tab.get(mode)
+        if stack and tab_name:
+            stack.set_visible_child_name(tab_name)
+
         if self.server is None:
             self._show_error("Couldn't connect to server")
 
