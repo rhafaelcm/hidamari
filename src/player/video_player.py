@@ -353,7 +353,6 @@ class VideoPlayer(BasePlayer):
 
         # Playlist state
         self._playlist_index = 0
-        self._playlist_play_count = 0
         self._playlist_event_attached = False
         self._is_transitioning = False
         self._playlist_wallpaper_set = False
@@ -562,8 +561,7 @@ class VideoPlayer(BasePlayer):
             mem_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
             logger.info(
                 f"[Playlist Health] threads={thread_count} mem={mem_mb:.1f}MB "
-                f"index={self._playlist_index} play_count={self._playlist_play_count} "
-                f"transitioning={self._is_transitioning} "
+                f"index={self._playlist_index} transitioning={self._is_transitioning} "
                 f"media_ends={self._media_end_count} transitions={self._transition_count}"
             )
         except Exception as e:
@@ -579,7 +577,6 @@ class VideoPlayer(BasePlayer):
             return
 
         self._playlist_index = 0
-        self._playlist_play_count = 0
         self._playlist_wallpaper_set = False
         self._media_end_count = 0
         self._transition_count = 0
@@ -598,12 +595,15 @@ class VideoPlayer(BasePlayer):
             return
 
         video_path = playlist[self._playlist_index]
-        logger.info(f"[Playlist] Playing video {self._playlist_index + 1}/{len(playlist)}: {video_path}")
+        repeat_count = self.config.get(CONFIG_KEY_PLAYLIST_REPEAT_COUNT, 1)
+        logger.info(f"[Playlist] Playing video {self._playlist_index + 1}/{len(playlist)} (repeat={repeat_count}x): {video_path}")
 
         self.config[CONFIG_KEY_DATA_SOURCE]['Default'] = video_path
 
         for monitor, window in self.windows.items():
             media = window.media_new(video_path)
+            if repeat_count > 1:
+                media.add_option(f":input-repeat={repeat_count - 1}")
             if not monitor.is_primary():
                 media.add_option("no-audio")
             window.set_media(media)
@@ -666,27 +666,17 @@ class VideoPlayer(BasePlayer):
         GLib.idle_add(self._playlist_advance)
 
     def _playlist_advance(self):
-        """Advance the playlist: repeat current video or move to next."""
+        """Advance the playlist to the next video (VLC handles repeats via input-repeat)."""
         playlist = self.config.get(CONFIG_KEY_PLAYLIST, [])
         if not playlist:
             return False
 
-        repeat_count = self.config.get(CONFIG_KEY_PLAYLIST_REPEAT_COUNT, 1)
-        self._playlist_play_count += 1
+        self._playlist_index = (self._playlist_index + 1) % len(playlist)
         logger.info(
-            f"[Playlist] Advance: play_count={self._playlist_play_count}/{repeat_count} "
-            f"index={self._playlist_index}/{len(playlist)} "
+            f"[Playlist] Advance: index={self._playlist_index}/{len(playlist)} "
             f"transitioning={self._is_transitioning} threads={threading.active_count()}"
         )
-
-        if self._playlist_play_count < repeat_count:
-            for monitor, window in self.windows.items():
-                window.stop()
-                window.play()
-        else:
-            self._playlist_play_count = 0
-            self._playlist_index = (self._playlist_index + 1) % len(playlist)
-            self._playlist_transition_to_next()
+        self._playlist_transition_to_next()
 
         return False
 
