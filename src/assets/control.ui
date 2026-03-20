@@ -516,6 +516,30 @@ To add videos, right-click on a video in the Local Video tab.</property>
                   </packing>
                 </child>
                 <child>
+                  <object class="GtkButton" id="ButtonPlaylistClear">
+                    <property name="visible">True</property>
+                    <property name="can-focus">True</property>
+                    <property name="receives-default">True</property>
+                    <property name="tooltip-text" translatable="yes">Clear playlist</property>
+                    <property name="halign">center</property>
+                    <property name="valign">center</property>
+                    <property name="action-name">app.playlist_clear</property>
+                    <child>
+                      <object class="GtkImage">
+                        <property name="visible">True</property>
+                        <property name="can-focus">False</property>
+                        <property name="icon-name">edit-clear-all-symbolic</property>
+                      </object>
+                    </child>
+                  </object>
+                  <packing>
+                    <property name="expand">False</property>
+                    <property name="fill">True</property>
+                    <property name="pack-type">end</property>
+                    <property name="position">1</property>
+                  </packing>
+                </child>
+                <child>
                   <object class="GtkButton" id="ButtonPlaylistRemove">
                     <property name="visible">True</property>
                     <property name="can-focus">True</property>
@@ -536,7 +560,7 @@ To add videos, right-click on a video in the Local Video tab.</property>
                     <property name="expand">False</property>
                     <property name="fill">True</property>
                     <property name="pack-type">end</property>
-                    <property name="position">1</property>
+                    <property name="position">2</property>
                   </packing>
                 </child>
                 <child>
@@ -615,6 +639,21 @@ To add videos, right-click on a video in the Local Video tab.</property>
               </packing>
             </child>
             <child>
+              <object class="GtkLabel" id="LabelPlaylistPending">
+                <property name="visible">False</property>
+                <property name="can-focus">False</property>
+                <property name="label" translatable="yes">&lt;i&gt;Unsaved changes. Click "Apply Playlist" to save.&lt;/i&gt;</property>
+                <property name="use-markup">True</property>
+                <property name="halign">start</property>
+              </object>
+              <packing>
+                <property name="expand">False</property>
+                <property name="fill">True</property>
+                <property name="pack-type">end</property>
+                <property name="position">2</property>
+              </packing>
+            </child>
+            <child>
               <object class="GtkBox">
                 <property name="visible">True</property>
                 <property name="can-focus">False</property>
@@ -669,7 +708,7 @@ To add videos, right-click on a video in the Local Video tab.</property>
                 <property name="expand">False</property>
                 <property name="fill">True</property>
                 <property name="pack-type">end</property>
-                <property name="position">2</property>
+                <property name="position">3</property>
               </packing>
             </child>
           </object>

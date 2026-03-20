@@ -156,6 +156,7 @@ class ControlPanel(Gtk.Application):
             ("about", self.on_about),
             ("quit", self.on_quit),
             ("add_all_to_playlist", self.on_add_all_to_playlist),
+            ("playlist_clear", self.on_playlist_clear),
             ("playlist_remove", self.on_playlist_remove),
             ("playlist_move_up", self.on_playlist_move_up),
             ("playlist_move_down", self.on_playlist_move_down),
@@ -587,6 +588,7 @@ class ControlPanel(Gtk.Application):
         thread = threading.Thread(
             target=self._load_playlist_metadata, args=(video_path, new_idx), daemon=True)
         thread.start()
+        self._set_playlist_pending(True)
         logger.info(f"[GUI] Added to playlist: {video_path}")
 
     def on_add_all_to_playlist(self, *_):
@@ -604,11 +606,24 @@ class ControlPanel(Gtk.Application):
                     target=self._load_playlist_metadata, args=(video_path, new_idx), daemon=True)
                 thread.start()
                 added += 1
+        if added > 0:
+            self._set_playlist_pending(True)
         logger.info(f"[GUI] Added {added} videos to playlist")
 
     def _playlist_renumber(self):
         for i, row in enumerate(self.playlist_store):
             row[1] = str(i + 1)
+
+    def _set_playlist_pending(self, pending):
+        label = self.builder.get_object("LabelPlaylistPending")
+        if label:
+            label.set_visible(pending)
+
+    def on_playlist_clear(self, *_):
+        if self.playlist_store is not None:
+            self.playlist_store.clear()
+        self._playlist_paths.clear()
+        self._set_playlist_pending(True)
 
     def on_playlist_remove(self, *_):
         tree_view: Gtk.TreeView = self.builder.get_object("PlaylistTreeView")
@@ -620,6 +635,7 @@ class ControlPanel(Gtk.Application):
             model.remove(tree_iter)
             del self._playlist_paths[index]
             self._playlist_renumber()
+            self._set_playlist_pending(True)
 
     def on_playlist_move_up(self, *_):
         tree_view: Gtk.TreeView = self.builder.get_object("PlaylistTreeView")
@@ -634,6 +650,7 @@ class ControlPanel(Gtk.Application):
                 self._playlist_paths[index], self._playlist_paths[index - 1] = \
                     self._playlist_paths[index - 1], self._playlist_paths[index]
                 self._playlist_renumber()
+                self._set_playlist_pending(True)
 
     def on_playlist_move_down(self, *_):
         tree_view: Gtk.TreeView = self.builder.get_object("PlaylistTreeView")
@@ -648,6 +665,7 @@ class ControlPanel(Gtk.Application):
                 self._playlist_paths[index], self._playlist_paths[index + 1] = \
                     self._playlist_paths[index + 1], self._playlist_paths[index]
                 self._playlist_renumber()
+                self._set_playlist_pending(True)
 
     def on_playlist_apply(self, *_):
         if not self._playlist_paths:
@@ -661,6 +679,7 @@ class ControlPanel(Gtk.Application):
         self.config[CONFIG_KEY_PLAYLIST_REPEAT_COUNT] = repeat_count
         self.config[CONFIG_KEY_MODE] = MODE_PLAYLIST
         self._save_config()
+        self._set_playlist_pending(False)
 
         logger.info(f"[GUI] Playlist applied: {len(self._playlist_paths)} videos, repeat={repeat_count}")
 
