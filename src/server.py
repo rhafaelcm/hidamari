@@ -122,7 +122,9 @@ class HidamariServer(object):
         # Set data source if specified
         if data_source and monitor:
             self.config[CONFIG_KEY_DATA_SOURCE][monitor] = data_source
-        self.config[CONFIG_KEY_DATA_SOURCE]['Default'] = data_source # always update default source
+        self.config[CONFIG_KEY_DATA_SOURCE]['Default'] = data_source
+
+        self._save_config()
 
         # Quit current then create a new player
         self._quit_player()
@@ -185,7 +187,6 @@ class HidamariServer(object):
         video_list = json.loads(playlist_json)
         self.config[CONFIG_KEY_PLAYLIST] = video_list
         self.config[CONFIG_KEY_PLAYLIST_REPEAT_COUNT] = repeat_count
-        self._save_config()
 
         first_video = video_list[0] if video_list else None
         self._setup_player(MODE_PLAYLIST, first_video)

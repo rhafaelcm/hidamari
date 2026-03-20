@@ -583,12 +583,9 @@ class VideoPlayer(BasePlayer):
         self._playlist_wallpaper_set = False
         self._media_end_count = 0
         self._transition_count = 0
-
         self._playlist_dimensions_cache.clear()
-        for video_path in playlist:
-            w, h = self._probe_video_dimensions(video_path)
-            self._playlist_dimensions_cache[video_path] = (w, h)
-        logger.info(f"[Playlist] Pre-cached dimensions for {len(playlist)} videos")
+
+        logger.info(f"[Playlist] Starting playlist with {len(playlist)} videos")
 
         GLib.timeout_add_seconds(60, self._playlist_health_check)
 
@@ -605,21 +602,21 @@ class VideoPlayer(BasePlayer):
 
         self.config[CONFIG_KEY_DATA_SOURCE]['Default'] = video_path
 
-        cached = self._playlist_dimensions_cache.get(video_path)
-        if cached:
-            video_width, video_height = cached
-        else:
-            video_width, video_height = self._probe_video_dimensions(video_path)
-            self._playlist_dimensions_cache[video_path] = (video_width, video_height)
-
         for monitor, window in self.windows.items():
             media = window.media_new(video_path)
             if not monitor.is_primary():
                 media.add_option("no-audio")
             window.set_media(media)
             window.set_position(0.0)
-            if video_width and video_height:
-                window.centercrop(video_width, video_height)
+
+        cached = self._playlist_dimensions_cache.get(video_path)
+        if cached:
+            video_width, video_height = cached
+            for monitor, window in self.windows.items():
+                if video_width and video_height:
+                    window.centercrop(video_width, video_height)
+        else:
+            self._probe_and_apply_centercrop(video_path)
 
         if not self._playlist_event_attached:
             for monitor, window in self.windows.items():
@@ -644,6 +641,23 @@ class VideoPlayer(BasePlayer):
             t.start()
         elif not self.config[CONFIG_KEY_STATIC_WALLPAPER] and not self._playlist_wallpaper_set:
             self.set_original_wallpaper()
+
+    def _probe_and_apply_centercrop(self, video_path):
+        """Probe video dimensions in background thread and apply centercrop via GTK main thread."""
+        def _probe_worker():
+            w, h = self._probe_video_dimensions(video_path)
+            self._playlist_dimensions_cache[video_path] = (w, h)
+            if w and h:
+                GLib.idle_add(self._apply_centercrop, w, h)
+
+        t = threading.Thread(target=_probe_worker, daemon=True)
+        t.start()
+
+    def _apply_centercrop(self, video_width, video_height):
+        """Apply centercrop to all windows (must be called from GTK main thread)."""
+        for monitor, window in self.windows.items():
+            window.centercrop(video_width, video_height)
+        return False
 
     def _on_playlist_media_end(self, event):
         """VLC callback when a video finishes. Runs in VLC thread, dispatches to GTK main thread."""
@@ -826,6 +840,9 @@ class VideoPlayer(BasePlayer):
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
+    logger.info("[Player] Process starting")
+
     bus = SessionBus()
     app = VideoPlayer()
     try:
