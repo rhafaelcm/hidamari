@@ -287,6 +287,24 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if self.__vlc_widget:
             self.__vlc_widget.cleanup()
 
+    def replace_vlc_widget(self):
+        """Replace the VLC widget with a fresh instance, cleaning up the old one in background."""
+        old_widget = self.__vlc_widget
+        self.__vlc_widget = VLCWidget(self.width, self.height)
+        self.remove(old_widget)
+        self.add(self.__vlc_widget)
+        self.__vlc_widget.show()
+        self.__vlc_widget.player.video_set_mouse_input(False)
+        self.__vlc_widget.player.video_set_key_input(False)
+
+        def _cleanup_old():
+            try:
+                old_widget.cleanup()
+            except Exception as e:
+                logger.warning(f"[PlayerWindow] Old widget cleanup error: {e}")
+
+        threading.Thread(target=_cleanup_old, daemon=True).start()
+
 
 class VideoPlayer(BasePlayer):
     """
@@ -641,6 +659,11 @@ class VideoPlayer(BasePlayer):
 
         self.config[CONFIG_KEY_DATA_SOURCE]['Default'] = video_path
 
+        self._playlist_event_attached = False
+
+        for monitor, window in self.windows.items():
+            window.replace_vlc_widget()
+
         for monitor, window in self.windows.items():
             media = window.media_new(video_path)
             if repeat_count > 1:
@@ -648,7 +671,6 @@ class VideoPlayer(BasePlayer):
             if not monitor.is_primary():
                 media.add_option("no-audio")
             window.set_media(media)
-            window.set_position(0.0)
 
         cached = self._playlist_dimensions_cache.get(video_path)
         if cached:
