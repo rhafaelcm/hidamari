@@ -153,6 +153,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.fade = Fade()
         self.fade_opacity = Fade()
 
+        self._pending_crop = None
+        self._crop_retries = 0
+        self._crop_max_retries = 10
+
         self.menu = None
         self.connect("button-press-event", self._on_button_press_event)
 
@@ -244,6 +248,62 @@ class PlayerWindow(Gtk.ApplicationWindow):
         logger.debug(f"[CenterCrop] Crop geometry: {crop_geometry}")
         self.__vlc_widget.player.video_set_crop_geometry(crop_geometry)
 
+    def schedule_centercrop(self, video_width, video_height, max_retries=10, interval_ms=150):
+        """Schedule centercrop to be applied once VLC's video output is ready."""
+        self._pending_crop = (video_width, video_height)
+        self._crop_retries = 0
+        self._crop_max_retries = max_retries
+
+        try:
+            em = self.__vlc_widget.player.event_manager()
+            em.event_detach(vlc.EventType.MediaPlayerVout)
+        except Exception:
+            pass
+        try:
+            em = self.__vlc_widget.player.event_manager()
+            em.event_attach(vlc.EventType.MediaPlayerVout, self._on_vout_ready)
+        except Exception as e:
+            logger.debug(f"[CenterCrop] Could not attach Vout event: {e}")
+
+        GLib.timeout_add(interval_ms, self._retry_centercrop)
+
+    def _on_vout_ready(self, event):
+        """Called by VLC when video output is created -- apply pending centercrop."""
+        if self._pending_crop:
+            w, h = self._pending_crop
+            self._pending_crop = None
+            logger.debug(f"[CenterCrop] Vout ready, applying crop {w}x{h}")
+            GLib.idle_add(self.centercrop, w, h)
+
+    def _retry_centercrop(self):
+        """Fallback timer: retry centercrop until VLC reports a valid video size."""
+        if not self._pending_crop:
+            return False
+        if self._crop_retries >= self._crop_max_retries:
+            w, h = self._pending_crop
+            self._pending_crop = None
+            logger.debug(f"[CenterCrop] Max retries reached, forcing crop {w}x{h}")
+            self.centercrop(w, h)
+            return False
+        self._crop_retries += 1
+        w, h = self._pending_crop
+        self.centercrop(w, h)
+        size = self.__vlc_widget.player.video_get_size()
+        if size[0] > 0 and size[1] > 0:
+            logger.debug(f"[CenterCrop] Retry #{self._crop_retries} succeeded (vout size {size[0]}x{size[1]})")
+            self._pending_crop = None
+            return False
+        return True
+
+    def _cancel_pending_crop(self):
+        """Cancel any pending centercrop schedule."""
+        self._pending_crop = None
+        try:
+            em = self.__vlc_widget.player.event_manager()
+            em.event_detach(vlc.EventType.MediaPlayerVout)
+        except Exception:
+            pass
+
     def add_audio_track(self, audio):
         self.__vlc_widget.player.add_slave(vlc.MediaSlaveType(1), audio, True)
 
@@ -286,6 +346,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
     def cleanup(self):
         """Cleanup resources to prevent memory leaks"""
+        self._cancel_pending_crop()
         self.fade.cancel()
         self.fade_opacity.cancel()
         if self.__vlc_widget:
@@ -298,6 +359,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         """
         old_widget = self.__vlc_widget
 
+        self._cancel_pending_crop()
         self.fade.cancel()
         self.fade_opacity.cancel()
 
@@ -704,15 +766,6 @@ class VideoPlayer(BasePlayer):
                 media.add_option("no-audio")
             window.set_media(media)
 
-        cached = self._playlist_dimensions_cache.get(video_path)
-        if cached:
-            video_width, video_height = cached
-            for monitor, window in self.windows.items():
-                if video_width and video_height:
-                    window.centercrop(video_width, video_height)
-        else:
-            self._probe_and_apply_centercrop(video_path)
-
         for monitor, window in self.windows.items():
             if monitor.is_primary():
                 em = window.get_event_manager()
@@ -723,6 +776,15 @@ class VideoPlayer(BasePlayer):
         self.volume = self.config[CONFIG_KEY_VOLUME]
         self.is_mute = self.config[CONFIG_KEY_MUTE]
         self.start_playback()
+
+        cached = self._playlist_dimensions_cache.get(video_path)
+        if cached:
+            video_width, video_height = cached
+            if video_width and video_height:
+                for monitor, window in self.windows.items():
+                    window.schedule_centercrop(video_width, video_height)
+        else:
+            self._probe_and_apply_centercrop(video_path)
 
         if not self.active_handler:
             self.active_handler = ActiveHandler(self._on_active_changed)
@@ -750,7 +812,7 @@ class VideoPlayer(BasePlayer):
     def _apply_centercrop(self, video_width, video_height):
         """Apply centercrop to all windows (must be called from GTK main thread)."""
         for monitor, window in self.windows.items():
-            window.centercrop(video_width, video_height)
+            window.schedule_centercrop(video_width, video_height)
         return False
 
     def _on_playlist_media_end(self, event):
