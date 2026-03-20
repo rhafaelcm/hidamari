@@ -1,3 +1,4 @@
+import gc
 import sys
 import glob
 import time
@@ -120,6 +121,9 @@ class VLCWidget(Gtk.DrawingArea):
         try:
             if self.player:
                 self.player.stop()
+                media = self.player.get_media()
+                if media is not None:
+                    media.release()
                 self.player.release()
                 self.player = None
             if self.instance:
@@ -288,22 +292,29 @@ class PlayerWindow(Gtk.ApplicationWindow):
             self.__vlc_widget.cleanup()
 
     def replace_vlc_widget(self):
-        """Replace the VLC widget with a fresh instance, cleaning up the old one in background."""
+        """Replace the VLC widget with a fresh instance.
+        Cleanup of old instance is synchronous to prevent GPU memory leaks --
+        the old VLC decoder must fully release GPU buffers before the new one allocates.
+        """
         old_widget = self.__vlc_widget
-        self.__vlc_widget = VLCWidget(self.width, self.height)
+
+        self.fade.cancel()
+        self.fade_opacity.cancel()
+
+        try:
+            old_widget.cleanup()
+        except Exception as e:
+            logger.warning(f"[PlayerWindow] Old widget cleanup error: {e}")
+
         self.remove(old_widget)
+        del old_widget
+        gc.collect()
+
+        self.__vlc_widget = VLCWidget(self.width, self.height)
         self.add(self.__vlc_widget)
         self.__vlc_widget.show()
         self.__vlc_widget.player.video_set_mouse_input(False)
         self.__vlc_widget.player.video_set_key_input(False)
-
-        def _cleanup_old():
-            try:
-                old_widget.cleanup()
-            except Exception as e:
-                logger.warning(f"[PlayerWindow] Old widget cleanup error: {e}")
-
-        threading.Thread(target=_cleanup_old, daemon=True).start()
 
 
 class VideoPlayer(BasePlayer):
@@ -378,6 +389,7 @@ class VideoPlayer(BasePlayer):
         self._last_watchdog_position = -1.0
         self._media_end_count = 0
         self._transition_count = 0
+        self._timers_active = False
 
     def new_window(self, gdk_monitor):
         rect = gdk_monitor.get_geometry()
@@ -574,6 +586,8 @@ class VideoPlayer(BasePlayer):
 
     def _playlist_health_check(self):
         """Periodic health check logging for playlist diagnostics."""
+        if not self._timers_active:
+            return False
         try:
             thread_count = threading.active_count()
             mem_mb = 0.0
@@ -593,7 +607,7 @@ class VideoPlayer(BasePlayer):
             )
         except Exception as e:
             logger.debug(f"[Playlist Health] Error collecting stats: {e}")
-        return True
+        return self._timers_active
 
     def _setup_playlist(self):
         """Initialize and start playlist playback."""
@@ -611,13 +625,17 @@ class VideoPlayer(BasePlayer):
 
         logger.info(f"[Playlist] Starting playlist with {len(playlist)} videos")
 
-        GLib.timeout_add_seconds(60, self._playlist_health_check)
-        GLib.timeout_add_seconds(30, self._playlist_watchdog)
+        if not self._timers_active:
+            self._timers_active = True
+            GLib.timeout_add_seconds(60, self._playlist_health_check)
+            GLib.timeout_add_seconds(30, self._playlist_watchdog)
 
         self._playlist_play_current()
 
     def _playlist_watchdog(self):
         """Detect stuck VLC player by checking if playback position progresses."""
+        if not self._timers_active:
+            return False
         try:
             primary_window = None
             for monitor, window in self.windows.items():
@@ -627,12 +645,12 @@ class VideoPlayer(BasePlayer):
             if not primary_window:
                 primary_window = next(iter(self.windows.values()), None)
             if not primary_window:
-                return True
+                return self._timers_active
 
             current_pos = primary_window.get_position()
             if self._is_transitioning:
                 self._last_watchdog_position = current_pos
-                return True
+                return self._timers_active
 
             if current_pos == self._last_watchdog_position and current_pos != -1.0:
                 logger.warning(
@@ -645,7 +663,21 @@ class VideoPlayer(BasePlayer):
                 self._last_watchdog_position = current_pos
         except Exception as e:
             logger.debug(f"[Playlist Watchdog] Error: {e}")
-        return True
+        return self._timers_active
+
+    def _detach_playlist_event(self):
+        """Detach MediaPlayerEndReached from the current primary player's event manager."""
+        if not self._playlist_event_attached:
+            return
+        for monitor, window in self.windows.items():
+            if monitor.is_primary():
+                try:
+                    em = window.get_event_manager()
+                    em.event_detach(vlc.EventType.MediaPlayerEndReached)
+                except Exception as e:
+                    logger.debug(f"[Playlist] event_detach error (expected during cleanup): {e}")
+                break
+        self._playlist_event_attached = False
 
     def _playlist_play_current(self):
         """Play the current video in the playlist on all monitors."""
@@ -659,7 +691,7 @@ class VideoPlayer(BasePlayer):
 
         self.config[CONFIG_KEY_DATA_SOURCE]['Default'] = video_path
 
-        self._playlist_event_attached = False
+        self._detach_playlist_event()
 
         for monitor, window in self.windows.items():
             window.replace_vlc_widget()
@@ -681,13 +713,12 @@ class VideoPlayer(BasePlayer):
         else:
             self._probe_and_apply_centercrop(video_path)
 
-        if not self._playlist_event_attached:
-            for monitor, window in self.windows.items():
-                if monitor.is_primary():
-                    em = window.get_event_manager()
-                    em.event_attach(vlc.EventType.MediaPlayerEndReached, self._on_playlist_media_end)
-                    self._playlist_event_attached = True
-                    break
+        for monitor, window in self.windows.items():
+            if monitor.is_primary():
+                em = window.get_event_manager()
+                em.event_attach(vlc.EventType.MediaPlayerEndReached, self._on_playlist_media_end)
+                self._playlist_event_attached = True
+                break
 
         self.volume = self.config[CONFIG_KEY_VOLUME]
         self.is_mute = self.config[CONFIG_KEY_MUTE]
@@ -846,9 +877,9 @@ class VideoPlayer(BasePlayer):
         self.config = ConfigUtil().load()
 
     def quit_player(self):
+        self._timers_active = False
         self.set_original_wallpaper()
         
-        # Cleanup handlers
         if self.active_handler:
             self.active_handler.cleanup()
             self.active_handler = None
@@ -857,10 +888,11 @@ class VideoPlayer(BasePlayer):
             self.window_handler.cleanup()
             self.window_handler = None
         
-        # Cleanup all windows
         for monitor, window in self.windows.items():
             if window:
                 window.cleanup()
+
+        gc.collect()
         
         super().quit_player()
 
