@@ -6,6 +6,7 @@ import ctypes
 import logging
 import pathlib
 import subprocess
+import threading
 from threading import Timer
 
 import gi
@@ -347,6 +348,8 @@ class VideoPlayer(BasePlayer):
         self._playlist_index = 0
         self._playlist_play_count = 0
         self._playlist_event_attached = False
+        self._is_transitioning = False
+        self._playlist_wallpaper_set = False
 
     def new_window(self, gdk_monitor):
         rect = gdk_monitor.get_geometry()
@@ -538,6 +541,7 @@ class VideoPlayer(BasePlayer):
 
         self._playlist_index = 0
         self._playlist_play_count = 0
+        self._playlist_wallpaper_set = False
         self._playlist_play_current()
 
     def _playlist_play_current(self):
@@ -590,9 +594,11 @@ class VideoPlayer(BasePlayer):
         if not self.window_handler and not is_wayland():
             self.window_handler = WindowHandler(self._on_window_state_changed)
 
-        if self.config[CONFIG_KEY_STATIC_WALLPAPER]:
-            self.set_static_wallpaper()
-        else:
+        if self.config[CONFIG_KEY_STATIC_WALLPAPER] and not self._playlist_wallpaper_set:
+            self._playlist_wallpaper_set = True
+            t = threading.Thread(target=self.set_static_wallpaper, daemon=True)
+            t.start()
+        elif not self.config[CONFIG_KEY_STATIC_WALLPAPER] and not self._playlist_wallpaper_set:
             self.set_original_wallpaper()
 
     def _on_playlist_media_end(self, event):
@@ -622,6 +628,10 @@ class VideoPlayer(BasePlayer):
 
     def _playlist_transition_to_next(self):
         """Fade out, switch video, then fade in for smooth transition."""
+        if self._is_transitioning:
+            return
+        self._is_transitioning = True
+
         primary_window = None
         for monitor, window in self.windows.items():
             if monitor.is_primary():
@@ -633,6 +643,7 @@ class VideoPlayer(BasePlayer):
 
         if not primary_window:
             self._playlist_play_current()
+            self._is_transitioning = False
             return
 
         def on_fade_out_complete():
@@ -649,6 +660,7 @@ class VideoPlayer(BasePlayer):
         self._playlist_play_current()
         for monitor, window in self.windows.items():
             window.fade_in_opacity(duration=0.5, interval=0.05)
+        self._is_transitioning = False
         return False
 
     def monitor_sync(self):

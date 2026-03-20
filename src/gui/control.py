@@ -552,18 +552,19 @@ class ControlPanel(Gtk.Application):
             self.playlist_store = Gtk.ListStore(GdkPixbuf.Pixbuf, str, str, str)
             generic_icon = Gtk.IconTheme.get_default().load_icon("video-x-generic", 48, 0)
             for idx, vp in enumerate(self._playlist_paths):
-                duration = get_video_duration(vp)
-                self.playlist_store.append([generic_icon, str(idx + 1), os.path.basename(vp), duration])
+                self.playlist_store.append([generic_icon, str(idx + 1), os.path.basename(vp), "--:--"])
                 thread = threading.Thread(
-                    target=self._load_playlist_thumbnail, args=(vp, idx))
-                thread.daemon = True
+                    target=self._load_playlist_metadata, args=(vp, idx), daemon=True)
                 thread.start()
 
-    def _load_playlist_thumbnail(self, video_path, idx):
+    def _load_playlist_metadata(self, video_path, idx):
         pixbuf = get_thumbnail_pixbuf(video_path, size=48)
-        if pixbuf is not None and self.playlist_store is not None:
+        duration = get_video_duration(video_path)
+        if self.playlist_store is not None:
             try:
-                self.playlist_store[idx][0] = pixbuf
+                if pixbuf is not None:
+                    self.playlist_store[idx][0] = pixbuf
+                self.playlist_store[idx][3] = duration
             except (IndexError, ValueError):
                 pass
 
@@ -581,12 +582,10 @@ class ControlPanel(Gtk.Application):
         self._ensure_playlist_store()
         self._playlist_paths.append(video_path)
         generic_icon = Gtk.IconTheme.get_default().load_icon("video-x-generic", 48, 0)
-        duration = get_video_duration(video_path)
         new_idx = len(self.playlist_store)
-        self.playlist_store.append([generic_icon, str(new_idx + 1), os.path.basename(video_path), duration])
+        self.playlist_store.append([generic_icon, str(new_idx + 1), os.path.basename(video_path), "--:--"])
         thread = threading.Thread(
-            target=self._load_playlist_thumbnail, args=(video_path, new_idx))
-        thread.daemon = True
+            target=self._load_playlist_metadata, args=(video_path, new_idx), daemon=True)
         thread.start()
         logger.info(f"[GUI] Added to playlist: {video_path}")
 
@@ -599,12 +598,10 @@ class ControlPanel(Gtk.Application):
         for video_path in self.video_paths:
             if video_path not in self._playlist_paths:
                 self._playlist_paths.append(video_path)
-                duration = get_video_duration(video_path)
                 new_idx = len(self.playlist_store)
-                self.playlist_store.append([generic_icon, str(new_idx + 1), os.path.basename(video_path), duration])
+                self.playlist_store.append([generic_icon, str(new_idx + 1), os.path.basename(video_path), "--:--"])
                 thread = threading.Thread(
-                    target=self._load_playlist_thumbnail, args=(video_path, new_idx))
-                thread.daemon = True
+                    target=self._load_playlist_metadata, args=(video_path, new_idx), daemon=True)
                 thread.start()
                 added += 1
         logger.info(f"[GUI] Added {added} videos to playlist")
@@ -691,11 +688,15 @@ class ControlPanel(Gtk.Application):
     def _load_icon_view_item(self, video_path, list_store, idx):
         get_thumbnail(video_path, list_store, idx)
         duration = get_video_duration(video_path)
+        name = os.path.basename(video_path)
+        GLib.idle_add(self._update_icon_view_text, list_store, idx, f"{name}\n{duration}")
+
+    def _update_icon_view_text(self, list_store, idx, text):
         try:
-            name = os.path.basename(video_path)
-            list_store[idx][1] = f"{name}\n{duration}"
+            list_store[idx][1] = text
         except (IndexError, ValueError):
             pass
+        return False
 
 
 def main(
