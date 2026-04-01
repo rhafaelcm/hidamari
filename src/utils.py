@@ -16,6 +16,18 @@ except ModuleNotFoundError:
 
 logger = logging.getLogger(LOGGER_NAME)
 
+PLAYLIST_MEDIA_INFO_DEFAULTS = {
+    "codec_name": "",
+    "pix_fmt": "",
+    "width": 0,
+    "height": 0,
+    "is_problematic": False,
+    "problem_code": "",
+    "warning_text": "",
+    "recommended_action": "",
+    "force_software_decode": False,
+}
+
 
 def is_gnome():
     """
@@ -126,6 +138,74 @@ def get_video_paths():
         if "video" in mime_type:
             file_list.append(filepath)
     return sorted(file_list)
+
+
+def normalize_playlist_media_info(media_info):
+    normalized = dict(PLAYLIST_MEDIA_INFO_DEFAULTS)
+    if isinstance(media_info, dict):
+        normalized.update(media_info)
+
+    normalized["codec_name"] = str(normalized.get("codec_name") or "").lower()
+    normalized["pix_fmt"] = str(normalized.get("pix_fmt") or "")
+    normalized["problem_code"] = str(normalized.get("problem_code") or "")
+    normalized["warning_text"] = str(normalized.get("warning_text") or "")
+    normalized["recommended_action"] = str(normalized.get("recommended_action") or "")
+    normalized["is_problematic"] = bool(normalized.get("is_problematic"))
+    normalized["force_software_decode"] = bool(normalized.get("force_software_decode"))
+
+    for key in ("width", "height"):
+        try:
+            normalized[key] = int(normalized.get(key) or 0)
+        except (TypeError, ValueError):
+            normalized[key] = 0
+
+    if normalized["codec_name"] == "av1":
+        normalized["is_problematic"] = True
+        if normalized["problem_code"] == PLAYLIST_PROBLEM_CODE_WATCHDOG_STALL:
+            normalized["warning_text"] = PLAYLIST_WARNING_TEXT_AV1_STALL
+        else:
+            normalized["problem_code"] = PLAYLIST_PROBLEM_CODE_UNSUPPORTED_HW_DECODE
+            normalized["warning_text"] = PLAYLIST_WARNING_TEXT_AV1
+        normalized["recommended_action"] = PLAYLIST_RECOMMENDED_ACTION_CONVERT_H264
+        normalized["force_software_decode"] = True
+    elif not normalized["is_problematic"]:
+        normalized["problem_code"] = ""
+        normalized["warning_text"] = ""
+        normalized["recommended_action"] = ""
+        normalized["force_software_decode"] = False
+
+    return normalized
+
+
+def build_playlist_media_info(video_path, timeout_sec=5):
+    media_info = normalize_playlist_media_info({})
+    try:
+        output = subprocess.check_output([
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name,pix_fmt,width,height",
+            "-of", "json", video_path
+        ], shell=False, encoding="UTF-8", timeout=timeout_sec)
+        streams = json.loads(output).get("streams", [])
+        if streams:
+            stream = streams[0]
+            media_info["codec_name"] = str(stream.get("codec_name") or "").lower()
+            media_info["pix_fmt"] = str(stream.get("pix_fmt") or "")
+            media_info["width"] = int(stream.get("width") or 0)
+            media_info["height"] = int(stream.get("height") or 0)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError, ValueError, TypeError):
+        pass
+    return normalize_playlist_media_info(media_info)
+
+
+def mark_playlist_media_info_stalled(media_info):
+    marked = normalize_playlist_media_info(media_info)
+    marked["is_problematic"] = True
+    marked["problem_code"] = PLAYLIST_PROBLEM_CODE_WATCHDOG_STALL
+    marked["warning_text"] = PLAYLIST_WARNING_TEXT_AV1_STALL
+    marked["recommended_action"] = PLAYLIST_RECOMMENDED_ACTION_CONVERT_H264
+    if marked["codec_name"] == "av1":
+        marked["force_software_decode"] = True
+    return normalize_playlist_media_info(marked)
 
 
 """
@@ -470,6 +550,12 @@ class ConfigUtil:
         config[CONFIG_KEY_PLAYLIST_REPEAT_COUNT] = CONFIG_TEMPLATE[CONFIG_KEY_PLAYLIST_REPEAT_COUNT]
         config['version'] = 5
         self.save(config)
+
+    def _migrateV5To6(self, config: dict):
+        logger.debug(f"[Config] Migration from version 5 to 6.")
+        config[CONFIG_KEY_PLAYLIST_MEDIA_INFO] = CONFIG_TEMPLATE[CONFIG_KEY_PLAYLIST_MEDIA_INFO]
+        config['version'] = 6
+        self.save(config)
         
     def _checkMissingMonitors(self, old_config: dict, template: dict):
         # Extract the monitors from both configurations
@@ -517,6 +603,17 @@ class ConfigUtil:
                         self._migrateV3To4(config)
                     if config.get("version") == 4 and CONFIG_VERSION >= 5:
                         self._migrateV4To5(config)
+                    if config.get("version") == 5 and CONFIG_VERSION >= 6:
+                        self._migrateV5To6(config)
+                    raw_media_info = config.get(CONFIG_KEY_PLAYLIST_MEDIA_INFO, {})
+                    if isinstance(raw_media_info, dict):
+                        config[CONFIG_KEY_PLAYLIST_MEDIA_INFO] = {
+                            path: normalize_playlist_media_info(info)
+                            for path, info in raw_media_info.items()
+                            if isinstance(path, str)
+                        }
+                    else:
+                        config[CONFIG_KEY_PLAYLIST_MEDIA_INFO] = {}
                     self._checkDefaultSource(config)
                     self._checkMissingMonitors(config, CONFIG_TEMPLATE)
                     if self._check(config):

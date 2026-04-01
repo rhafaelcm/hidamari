@@ -22,17 +22,27 @@ try:
     from commons import *
     from monitor import *
     from gui.gui_utils import get_thumbnail, get_thumbnail_pixbuf, get_video_duration, debounce
-    from utils import ConfigUtil, setup_autostart, is_gnome, is_wayland, get_video_paths
+    from utils import (
+        ConfigUtil,
+        build_playlist_media_info,
+        get_video_paths,
+        is_gnome,
+        is_wayland,
+        normalize_playlist_media_info,
+        setup_autostart,
+    )
 except ModuleNotFoundError:
     from hidamari.monitor import *
     from hidamari.commons import *
     from hidamari.gui.gui_utils import get_thumbnail, get_thumbnail_pixbuf, get_video_duration, debounce
     from hidamari.utils import (
+        build_playlist_media_info,
         ConfigUtil,
+        get_video_paths,
         setup_autostart,
         is_gnome,
         is_wayland,
-        get_video_paths,
+        normalize_playlist_media_info,
     )
 
 logging.basicConfig(level=logging.DEBUG)
@@ -41,6 +51,14 @@ logger = logging.getLogger(LOGGER_NAME)
 APP_ID = f"{PROJECT}.gui"
 APP_TITLE = "Hidamari"
 APP_UI_RESOURCE_PATH = "/io/jeffshee/Hidamari/control.ui"
+PLAYLIST_WARNING_COLOR = "#c97a00"
+PLAYLIST_COL_PIXBUF = 0
+PLAYLIST_COL_INDEX = 1
+PLAYLIST_COL_NAME = 2
+PLAYLIST_COL_DURATION = 3
+PLAYLIST_COL_FOREGROUND = 4
+PLAYLIST_COL_TOOLTIP = 5
+PLAYLIST_COL_PATH = 6
 
 
 class ControlPanel(Gtk.Application):
@@ -84,6 +102,7 @@ class ControlPanel(Gtk.Application):
         self._load_config()
 
         self._playlist_paths = list(self.config.get(CONFIG_KEY_PLAYLIST, []))
+        self._playlist_media_info = dict(self.config.get(CONFIG_KEY_PLAYLIST_MEDIA_INFO, {}))
 
         # initialize monitors
         self.monitors = Monitors()
@@ -126,6 +145,7 @@ class ControlPanel(Gtk.Application):
 
     def _load_config(self):
         self.config = ConfigUtil().load()
+        self._playlist_media_info = dict(self.config.get(CONFIG_KEY_PLAYLIST_MEDIA_INFO, {}))
 
     def _save_config(self):
         ConfigUtil().save(self.config)
@@ -133,6 +153,93 @@ class ControlPanel(Gtk.Application):
     @debounce(1)
     def _save_config_delay(self):
         self._save_config()
+
+    def _get_playlist_media_info(self, video_path):
+        return normalize_playlist_media_info(self._playlist_media_info.get(video_path, {}))
+
+    def _set_playlist_media_info(self, video_path, media_info):
+        normalized = normalize_playlist_media_info(media_info)
+        if self._playlist_media_info.get(video_path) == normalized:
+            return False
+        self._playlist_media_info[video_path] = normalized
+        self.config[CONFIG_KEY_PLAYLIST_MEDIA_INFO] = dict(self._playlist_media_info)
+        return True
+
+    def _prune_playlist_media_info(self):
+        kept_paths = set(self._playlist_paths)
+        pruned = {
+            path: info for path, info in self._playlist_media_info.items()
+            if path in kept_paths
+        }
+        if pruned == self._playlist_media_info:
+            return False
+        self._playlist_media_info = pruned
+        self.config[CONFIG_KEY_PLAYLIST_MEDIA_INFO] = dict(self._playlist_media_info)
+        return True
+
+    def _build_playlist_display_markup(self, video_path):
+        name = GLib.markup_escape_text(os.path.basename(video_path))
+        media_info = self._get_playlist_media_info(video_path)
+        if media_info.get("is_problematic"):
+            return f"{name} <b>[AV1 / CPU]</b>"
+        return name
+
+    def _get_playlist_row_color(self, video_path):
+        media_info = self._get_playlist_media_info(video_path)
+        if media_info.get("is_problematic"):
+            return PLAYLIST_WARNING_COLOR
+        return ""
+
+    def _get_playlist_warning_text(self, video_path):
+        return self._get_playlist_media_info(video_path).get("warning_text") or ""
+
+    def _find_playlist_iter(self, video_path):
+        if self.playlist_store is None:
+            return None
+        tree_iter = self.playlist_store.get_iter_first()
+        while tree_iter is not None:
+            if self.playlist_store[tree_iter][PLAYLIST_COL_PATH] == video_path:
+                return tree_iter
+            tree_iter = self.playlist_store.iter_next(tree_iter)
+        return None
+
+    def _refresh_playlist_row(self, tree_iter, video_path):
+        self.playlist_store[tree_iter][PLAYLIST_COL_NAME] = self._build_playlist_display_markup(video_path)
+        self.playlist_store[tree_iter][PLAYLIST_COL_FOREGROUND] = self._get_playlist_row_color(video_path)
+        self.playlist_store[tree_iter][PLAYLIST_COL_TOOLTIP] = self._get_playlist_warning_text(video_path)
+        self.playlist_store[tree_iter][PLAYLIST_COL_PATH] = video_path
+
+    def _append_playlist_row(self, video_path, duration="--:--"):
+        generic_icon = Gtk.IconTheme.get_default().load_icon("video-x-generic", 48, 0)
+        row = self.playlist_store.append([
+            generic_icon,
+            str(len(self.playlist_store) + 1),
+            "",
+            duration,
+            "",
+            "",
+            video_path,
+        ])
+        self._refresh_playlist_row(row, video_path)
+        return row
+
+    def _queue_playlist_metadata_load(self, video_path):
+        thread = threading.Thread(
+            target=self._load_playlist_metadata, args=(video_path,), daemon=True)
+        thread.start()
+
+    def _apply_playlist_metadata(self, video_path, pixbuf, duration, media_info):
+        tree_iter = self._find_playlist_iter(video_path)
+        if tree_iter is None:
+            return False
+        if pixbuf is not None:
+            self.playlist_store[tree_iter][PLAYLIST_COL_PIXBUF] = pixbuf
+        if duration:
+            self.playlist_store[tree_iter][PLAYLIST_COL_DURATION] = duration
+        if self._set_playlist_media_info(video_path, media_info):
+            self._save_config_delay()
+        self._refresh_playlist_row(tree_iter, video_path)
+        return False
 
     def do_startup(self):
         Gtk.Application.do_startup(self)
@@ -536,24 +643,25 @@ class ControlPanel(Gtk.Application):
         if not tree_view.get_model():
             self._ensure_playlist_store()
             tree_view.set_model(self.playlist_store)
+            tree_view.set_tooltip_column(PLAYLIST_COL_TOOLTIP)
 
             renderer_thumb = Gtk.CellRendererPixbuf()
-            col_thumb = Gtk.TreeViewColumn("", renderer_thumb, pixbuf=0)
+            col_thumb = Gtk.TreeViewColumn("", renderer_thumb, pixbuf=PLAYLIST_COL_PIXBUF)
             col_thumb.set_min_width(56)
             tree_view.append_column(col_thumb)
 
             renderer_index = Gtk.CellRendererText()
-            col_index = Gtk.TreeViewColumn("#", renderer_index, text=1)
+            col_index = Gtk.TreeViewColumn("#", renderer_index, text=PLAYLIST_COL_INDEX, foreground=PLAYLIST_COL_FOREGROUND)
             col_index.set_min_width(40)
             tree_view.append_column(col_index)
 
             renderer_name = Gtk.CellRendererText()
-            col_name = Gtk.TreeViewColumn("Video", renderer_name, text=2)
+            col_name = Gtk.TreeViewColumn("Video", renderer_name, markup=PLAYLIST_COL_NAME, foreground=PLAYLIST_COL_FOREGROUND)
             col_name.set_expand(True)
             tree_view.append_column(col_name)
 
             renderer_duration = Gtk.CellRendererText()
-            col_duration = Gtk.TreeViewColumn("Duration", renderer_duration, text=3)
+            col_duration = Gtk.TreeViewColumn("Duration", renderer_duration, text=PLAYLIST_COL_DURATION, foreground=PLAYLIST_COL_FOREGROUND)
             col_duration.set_min_width(70)
             tree_view.append_column(col_duration)
 
@@ -562,24 +670,16 @@ class ControlPanel(Gtk.Application):
 
     def _ensure_playlist_store(self):
         if self.playlist_store is None:
-            self.playlist_store = Gtk.ListStore(GdkPixbuf.Pixbuf, str, str, str)
-            generic_icon = Gtk.IconTheme.get_default().load_icon("video-x-generic", 48, 0)
-            for idx, vp in enumerate(self._playlist_paths):
-                self.playlist_store.append([generic_icon, str(idx + 1), os.path.basename(vp), "--:--"])
-                thread = threading.Thread(
-                    target=self._load_playlist_metadata, args=(vp, idx), daemon=True)
-                thread.start()
+            self.playlist_store = Gtk.ListStore(GdkPixbuf.Pixbuf, str, str, str, str, str, str)
+            for vp in self._playlist_paths:
+                self._append_playlist_row(vp)
+                self._queue_playlist_metadata_load(vp)
 
-    def _load_playlist_metadata(self, video_path, idx):
+    def _load_playlist_metadata(self, video_path):
         pixbuf = get_thumbnail_pixbuf(video_path, size=48)
         duration = get_video_duration(video_path)
-        if self.playlist_store is not None:
-            try:
-                if pixbuf is not None:
-                    self.playlist_store[idx][0] = pixbuf
-                self.playlist_store[idx][3] = duration
-            except (IndexError, ValueError):
-                pass
+        media_info = build_playlist_media_info(video_path)
+        GLib.idle_add(self._apply_playlist_metadata, video_path, pixbuf, duration, media_info)
 
     def on_add_to_playlist_context(self, *_):
         selected = self.icon_view.get_selected_items()
@@ -594,12 +694,8 @@ class ControlPanel(Gtk.Application):
 
         self._ensure_playlist_store()
         self._playlist_paths.append(video_path)
-        generic_icon = Gtk.IconTheme.get_default().load_icon("video-x-generic", 48, 0)
-        new_idx = len(self.playlist_store)
-        self.playlist_store.append([generic_icon, str(new_idx + 1), os.path.basename(video_path), "--:--"])
-        thread = threading.Thread(
-            target=self._load_playlist_metadata, args=(video_path, new_idx), daemon=True)
-        thread.start()
+        self._append_playlist_row(video_path)
+        self._queue_playlist_metadata_load(video_path)
         self._set_playlist_pending(True)
         logger.info(f"[GUI] Added to playlist: {video_path}")
 
@@ -607,16 +703,12 @@ class ControlPanel(Gtk.Application):
         if not self.video_paths:
             return
         self._ensure_playlist_store()
-        generic_icon = Gtk.IconTheme.get_default().load_icon("video-x-generic", 48, 0)
         added = 0
         for video_path in self.video_paths:
             if video_path not in self._playlist_paths:
                 self._playlist_paths.append(video_path)
-                new_idx = len(self.playlist_store)
-                self.playlist_store.append([generic_icon, str(new_idx + 1), os.path.basename(video_path), "--:--"])
-                thread = threading.Thread(
-                    target=self._load_playlist_metadata, args=(video_path, new_idx), daemon=True)
-                thread.start()
+                self._append_playlist_row(video_path)
+                self._queue_playlist_metadata_load(video_path)
                 added += 1
         if added > 0:
             self._set_playlist_pending(True)
@@ -635,6 +727,8 @@ class ControlPanel(Gtk.Application):
         if self.playlist_store is not None:
             self.playlist_store.clear()
         self._playlist_paths.clear()
+        self._playlist_media_info.clear()
+        self.config[CONFIG_KEY_PLAYLIST_MEDIA_INFO] = {}
         self._set_playlist_pending(True)
 
     def on_playlist_remove(self, *_):
@@ -690,6 +784,8 @@ class ControlPanel(Gtk.Application):
         self.config[CONFIG_KEY_PLAYLIST] = list(self._playlist_paths)
         self.config[CONFIG_KEY_PLAYLIST_REPEAT_COUNT] = repeat_count
         self.config[CONFIG_KEY_MODE] = MODE_PLAYLIST
+        self._prune_playlist_media_info()
+        self.config[CONFIG_KEY_PLAYLIST_MEDIA_INFO] = dict(self._playlist_media_info)
         self._save_config()
         self._set_playlist_pending(False)
 

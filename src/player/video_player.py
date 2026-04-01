@@ -24,13 +24,35 @@ try:
     from player.base_player import BasePlayer
     from menu import build_menu
     from commons import *
-    from utils import ActiveHandler, ConfigUtil, is_gnome, is_wayland, is_nvidia_proprietary, is_vdpau_ok, is_flatpak
+    from utils import (
+        ActiveHandler,
+        ConfigUtil,
+        build_playlist_media_info,
+        is_flatpak,
+        is_gnome,
+        is_nvidia_proprietary,
+        is_vdpau_ok,
+        is_wayland,
+        mark_playlist_media_info_stalled,
+        normalize_playlist_media_info,
+    )
     from yt_utils import get_formats, get_best_audio, get_optimal_video
 except ModuleNotFoundError:
     from hidamari.player.base_player import BasePlayer
     from hidamari.menu import build_menu
     from hidamari.commons import *
-    from hidamari.utils import ActiveHandler, ConfigUtil, is_gnome, is_wayland, is_nvidia_proprietary, is_vdpau_ok, is_flatpak
+    from hidamari.utils import (
+        ActiveHandler,
+        ConfigUtil,
+        build_playlist_media_info,
+        is_flatpak,
+        is_gnome,
+        is_nvidia_proprietary,
+        is_vdpau_ok,
+        is_wayland,
+        mark_playlist_media_info_stalled,
+        normalize_playlist_media_info,
+    )
     from hidamari.yt_utils import get_formats, get_best_audio, get_optimal_video
 
 logger = logging.getLogger(LOGGER_NAME)
@@ -455,6 +477,10 @@ class VideoPlayer(BasePlayer):
         self._transition_count = 0
         self._playlist_recovery_count = 0
         self._playlist_recovering = False
+        self._playlist_info_lock = threading.Lock()
+        self._playlist_preload_generation = 0
+        self._playlist_preload_thread = None
+        self._current_recovery_attempts = 0
         self._timers_active = False
 
     def new_window(self, gdk_monitor):
@@ -650,6 +676,76 @@ class VideoPlayer(BasePlayer):
         except (subprocess.CalledProcessError, IndexError, ValueError):
             return None, None
 
+    def _get_playlist_media_info_map(self):
+        media_info = self.config.get(CONFIG_KEY_PLAYLIST_MEDIA_INFO)
+        if not isinstance(media_info, dict):
+            media_info = {}
+            self.config[CONFIG_KEY_PLAYLIST_MEDIA_INFO] = media_info
+        return media_info
+
+    def _get_playlist_media_info(self, video_path):
+        return normalize_playlist_media_info(self._get_playlist_media_info_map().get(video_path, {}))
+
+    def _set_playlist_media_info(self, video_path, media_info, save=False):
+        normalized = normalize_playlist_media_info(media_info)
+        should_save = False
+        with self._playlist_info_lock:
+            current = self._get_playlist_media_info_map().get(video_path)
+            if current != normalized:
+                self._get_playlist_media_info_map()[video_path] = normalized
+                should_save = True
+        if should_save and save:
+            ConfigUtil().save(self.config)
+        return should_save
+
+    def _prune_playlist_media_info(self, playlist):
+        pruned = {
+            path: normalize_playlist_media_info(info)
+            for path, info in self._get_playlist_media_info_map().items()
+            if path in playlist
+        }
+        with self._playlist_info_lock:
+            if pruned == self._get_playlist_media_info_map():
+                return False
+            self.config[CONFIG_KEY_PLAYLIST_MEDIA_INFO] = pruned
+        ConfigUtil().save(self.config)
+        return True
+
+    def _apply_centercrop_if_current(self, video_path, video_width, video_height):
+        if video_path != self._get_playlist_video_path():
+            return False
+        self._apply_centercrop(video_width, video_height)
+        return False
+
+    def _start_playlist_metadata_preload(self, playlist):
+        self._playlist_preload_generation += 1
+        generation = self._playlist_preload_generation
+
+        def _worker():
+            changed = False
+            for video_path in playlist:
+                if generation != self._playlist_preload_generation or not self._timers_active:
+                    return
+                media_info = build_playlist_media_info(video_path, timeout_sec=5)
+                if media_info.get("width") and media_info.get("height"):
+                    self._playlist_dimensions_cache[video_path] = (
+                        media_info["width"],
+                        media_info["height"],
+                    )
+                    GLib.idle_add(
+                        self._apply_centercrop_if_current,
+                        video_path,
+                        media_info["width"],
+                        media_info["height"],
+                    )
+                if self._set_playlist_media_info(video_path, media_info, save=False):
+                    changed = True
+            if changed:
+                ConfigUtil().save(self.config)
+
+        self._playlist_preload_thread = threading.Thread(target=_worker, daemon=True)
+        self._playlist_preload_thread.start()
+
     def _playlist_health_check(self):
         """Periodic health check logging for playlist diagnostics."""
         if not self._timers_active:
@@ -671,6 +767,14 @@ class VideoPlayer(BasePlayer):
                 f"index={self._playlist_index} transitioning={self._is_transitioning} "
                 f"media_ends={self._media_end_count} transitions={self._transition_count}"
             )
+            video_path = self._get_playlist_video_path()
+            if video_path:
+                media_info = self._get_playlist_media_info(video_path)
+                logger.info(
+                    f"[Playlist Health] codec={media_info.get('codec_name') or 'unknown'} "
+                    f"problematic={media_info.get('is_problematic')} "
+                    f"sw_decode={media_info.get('force_software_decode')}"
+                )
         except Exception as e:
             logger.debug(f"[Playlist Health] Error collecting stats: {e}")
         return self._timers_active
@@ -688,6 +792,15 @@ class VideoPlayer(BasePlayer):
         self._media_end_count = 0
         self._transition_count = 0
         self._playlist_dimensions_cache.clear()
+        self._current_recovery_attempts = 0
+        self._prune_playlist_media_info(playlist)
+        for video_path in playlist:
+            media_info = self._get_playlist_media_info(video_path)
+            if media_info.get("width") and media_info.get("height"):
+                self._playlist_dimensions_cache[video_path] = (
+                    media_info["width"],
+                    media_info["height"],
+                )
 
         logger.info(f"[Playlist] Starting playlist with {len(playlist)} videos")
 
@@ -696,6 +809,7 @@ class VideoPlayer(BasePlayer):
             GLib.timeout_add_seconds(60, self._playlist_health_check)
             GLib.timeout_add_seconds(30, self._playlist_watchdog)
 
+        self._start_playlist_metadata_preload(playlist)
         self._playlist_play_current()
 
     def _get_playlist_video_path(self):
@@ -705,12 +819,36 @@ class VideoPlayer(BasePlayer):
         return playlist[self._playlist_index]
 
     def _set_playlist_media(self, monitor, window, video_path, repeat_count):
+        media_info = self._get_playlist_media_info(video_path)
         media = window.media_new(video_path)
         if repeat_count > 1:
             media.add_option(f":input-repeat={repeat_count - 1}")
         if not monitor.is_primary():
             media.add_option("no-audio")
+        if media_info.get("force_software_decode"):
+            media.add_option(":avcodec-hw=none")
         window.set_media(media)
+
+    def _advance_problematic_video(self, reason):
+        video_path = self._get_playlist_video_path()
+        if not video_path:
+            return False
+        media_info = self._get_playlist_media_info(video_path)
+        if not media_info.get("is_problematic") or self._current_recovery_attempts < 1:
+            return False
+        logger.warning(
+            f"[Playlist] Problematic video stalled again after recovery; advancing "
+            f"(reason={reason}, index={self._playlist_index})"
+        )
+        self._set_playlist_media_info(
+            video_path,
+            mark_playlist_media_info_stalled(media_info),
+            save=True,
+        )
+        self._playlist_stall_count = 0
+        self._last_watchdog_position = -1.0
+        self._on_playlist_media_end(None)
+        return True
 
     def _attach_playlist_events(self):
         for monitor, window in self.windows.items():
@@ -757,6 +895,8 @@ class VideoPlayer(BasePlayer):
                     f"[Playlist Watchdog] Player stuck at position {current_pos:.4f} "
                     f"index={self._playlist_index}, stalls={self._playlist_stall_count}"
                 )
+                if self._advance_problematic_video("watchdog"):
+                    return self._timers_active
                 if self._playlist_stall_count == 1:
                     GLib.idle_add(self._playlist_recover_current, "watchdog")
                 else:
@@ -785,7 +925,7 @@ class VideoPlayer(BasePlayer):
                 break
         self._playlist_event_attached = False
 
-    def _playlist_play_current(self, recover_players=False):
+    def _playlist_play_current(self, recover_players=False, reset_recovery_attempts=True):
         """Play the current video in the playlist on all monitors."""
         video_path = self._get_playlist_video_path()
         if not video_path:
@@ -793,7 +933,13 @@ class VideoPlayer(BasePlayer):
 
         playlist = self.config.get(CONFIG_KEY_PLAYLIST, [])
         repeat_count = self.config.get(CONFIG_KEY_PLAYLIST_REPEAT_COUNT, 1)
-        logger.info(f"[Playlist] Playing video {self._playlist_index + 1}/{len(playlist)} (repeat={repeat_count}x): {video_path}")
+        media_info = self._get_playlist_media_info(video_path)
+        logger.info(
+            f"[Playlist] Playing video {self._playlist_index + 1}/{len(playlist)} "
+            f"(repeat={repeat_count}x, codec={media_info.get('codec_name') or 'unknown'}, "
+            f"problematic={media_info.get('is_problematic')}, "
+            f"sw_decode={media_info.get('force_software_decode')}): {video_path}"
+        )
 
         self.config[CONFIG_KEY_DATA_SOURCE]['Default'] = video_path
 
@@ -813,6 +959,8 @@ class VideoPlayer(BasePlayer):
         self.is_mute = self.config[CONFIG_KEY_MUTE]
         self._last_watchdog_position = -1.0
         self._playlist_stall_count = 0
+        if reset_recovery_attempts:
+            self._current_recovery_attempts = 0
         self.start_playback()
 
         cached = self._playlist_dimensions_cache.get(video_path)
@@ -821,8 +969,6 @@ class VideoPlayer(BasePlayer):
             if video_width and video_height:
                 for monitor, window in self.windows.items():
                     window.schedule_centercrop(video_width, video_height)
-        else:
-            self._probe_and_apply_centercrop(video_path)
 
         if not self.active_handler:
             self.active_handler = ActiveHandler(self._on_active_changed)
@@ -835,17 +981,6 @@ class VideoPlayer(BasePlayer):
             t.start()
         elif not self.config[CONFIG_KEY_STATIC_WALLPAPER] and not self._playlist_wallpaper_set:
             self.set_original_wallpaper()
-
-    def _probe_and_apply_centercrop(self, video_path):
-        """Probe video dimensions in background thread and apply centercrop via GTK main thread."""
-        def _probe_worker():
-            w, h = self._probe_video_dimensions(video_path)
-            self._playlist_dimensions_cache[video_path] = (w, h)
-            if w and h:
-                GLib.idle_add(self._apply_centercrop, w, h)
-
-        t = threading.Thread(target=_probe_worker, daemon=True)
-        t.start()
 
     def _apply_centercrop(self, video_width, video_height):
         """Apply centercrop to all windows (must be called from GTK main thread)."""
@@ -862,7 +997,12 @@ class VideoPlayer(BasePlayer):
     def _on_playlist_media_error(self, event):
         """VLC callback when playback fails. Runs in VLC thread, dispatches recovery to GTK main thread."""
         logger.warning(f"[Playlist] Media error received (transitioning={self._is_transitioning})")
-        GLib.idle_add(self._playlist_recover_current, "vlc-error")
+        GLib.idle_add(self._handle_playlist_media_error, "vlc-error")
+
+    def _handle_playlist_media_error(self, reason):
+        if self._advance_problematic_video(reason):
+            return False
+        return self._playlist_recover_current(reason)
 
     def _playlist_advance(self):
         """Advance the playlist to the next video (VLC handles repeats via input-repeat)."""
@@ -907,13 +1047,14 @@ class VideoPlayer(BasePlayer):
 
         self._playlist_recovering = True
         self._playlist_recovery_count += 1
+        self._current_recovery_attempts += 1
         logger.warning(
             f"[Playlist] Recovery #{self._playlist_recovery_count} starting "
             f"(reason={reason}, index={self._playlist_index})"
         )
 
         try:
-            self._playlist_play_current(recover_players=True)
+            self._playlist_play_current(recover_players=True, reset_recovery_attempts=False)
             logger.info(
                 f"[Playlist] Recovery #{self._playlist_recovery_count} complete "
                 f"(index={self._playlist_index})"
@@ -1009,6 +1150,7 @@ class VideoPlayer(BasePlayer):
 
     def reload_config(self):
         self.config = ConfigUtil().load()
+        self.config.setdefault(CONFIG_KEY_PLAYLIST_MEDIA_INFO, {})
 
     def quit_player(self):
         self._timers_active = False
