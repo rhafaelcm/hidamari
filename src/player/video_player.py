@@ -118,17 +118,19 @@ class VLCWidget(Gtk.DrawingArea):
 
     def cleanup(self):
         """Cleanup VLC resources to prevent memory leaks"""
+        player = self.player
+        instance = self.instance
+        self.player = None
+        self.instance = None
+
         try:
-            if self.player:
-                self.player.stop()
-                media = self.player.get_media()
+            if player:
+                media = player.get_media()
                 if media is not None:
                     media.release()
-                self.player.release()
-                self.player = None
-            if self.instance:
-                self.instance.release()
-                self.instance = None
+                player.release()
+            if instance:
+                instance.release()
         except Exception as e:
             logger.warning(f"[VLCWidget] Cleanup error: {e}")
 
@@ -140,14 +142,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.width = width
         self.height = height
         self.name = name
-        self.__vlc_widget = VLCWidget(width, height)
-        self.add(self.__vlc_widget)
-        self.__vlc_widget.show()
-
-        # These are to allow us to right click. VLC can't hijack mouse input, and probably not key inputs either in
-        # Case we want to add keyboard shortcuts later on.
-        self.__vlc_widget.player.video_set_mouse_input(False)
-        self.__vlc_widget.player.video_set_key_input(False)
+        self.__vlc_widget = None
+        self._create_vlc_widget()
 
         # A timer that handling fade-in/out
         self.fade = Fade()
@@ -159,6 +155,16 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
         self.menu = None
         self.connect("button-press-event", self._on_button_press_event)
+
+    def _create_vlc_widget(self):
+        self.__vlc_widget = VLCWidget(self.width, self.height)
+        self.add(self.__vlc_widget)
+        self.__vlc_widget.show()
+
+        # These are to allow us to right click. VLC can't hijack mouse input, and probably not key inputs either in
+        # Case we want to add keyboard shortcuts later on.
+        self.__vlc_widget.player.video_set_mouse_input(False)
+        self.__vlc_widget.player.video_set_key_input(False)
 
     def play(self):
         self.__vlc_widget.player.play()
@@ -196,6 +202,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         return self.__vlc_widget.instance.media_new(*args)
 
     def set_media(self, *args):
+        self._cancel_pending_crop()
         old_media = self.__vlc_widget.player.get_media()
         self.__vlc_widget.player.set_media(*args)
         if old_media is not None:
@@ -351,12 +358,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.fade_opacity.cancel()
         if self.__vlc_widget:
             self.__vlc_widget.cleanup()
+            self.__vlc_widget = None
 
-    def replace_vlc_widget(self):
-        """Replace the VLC widget with a fresh instance.
-        Cleanup of old instance is synchronous to prevent GPU memory leaks --
-        the old VLC decoder must fully release GPU buffers before the new one allocates.
-        """
+    def recover_vlc_widget(self):
+        """Replace the VLC widget with a fresh instance after a playback failure."""
         old_widget = self.__vlc_widget
 
         self._cancel_pending_crop()
@@ -372,11 +377,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         del old_widget
         gc.collect()
 
-        self.__vlc_widget = VLCWidget(self.width, self.height)
-        self.add(self.__vlc_widget)
-        self.__vlc_widget.show()
-        self.__vlc_widget.player.video_set_mouse_input(False)
-        self.__vlc_widget.player.video_set_key_input(False)
+        self._create_vlc_widget()
 
 
 class VideoPlayer(BasePlayer):
@@ -449,8 +450,11 @@ class VideoPlayer(BasePlayer):
         self._playlist_wallpaper_set = False
         self._playlist_dimensions_cache = {}
         self._last_watchdog_position = -1.0
+        self._playlist_stall_count = 0
         self._media_end_count = 0
         self._transition_count = 0
+        self._playlist_recovery_count = 0
+        self._playlist_recovering = False
         self._timers_active = False
 
     def new_window(self, gdk_monitor):
@@ -694,6 +698,33 @@ class VideoPlayer(BasePlayer):
 
         self._playlist_play_current()
 
+    def _get_playlist_video_path(self):
+        playlist = self.config.get(CONFIG_KEY_PLAYLIST, [])
+        if not playlist:
+            return None
+        return playlist[self._playlist_index]
+
+    def _set_playlist_media(self, monitor, window, video_path, repeat_count):
+        media = window.media_new(video_path)
+        if repeat_count > 1:
+            media.add_option(f":input-repeat={repeat_count - 1}")
+        if not monitor.is_primary():
+            media.add_option("no-audio")
+        window.set_media(media)
+
+    def _attach_playlist_events(self):
+        for monitor, window in self.windows.items():
+            if not monitor.is_primary():
+                continue
+            try:
+                em = window.get_event_manager()
+                em.event_attach(vlc.EventType.MediaPlayerEndReached, self._on_playlist_media_end)
+                em.event_attach(vlc.EventType.MediaPlayerEncounteredError, self._on_playlist_media_error)
+                self._playlist_event_attached = True
+            except Exception as e:
+                logger.warning(f"[Playlist] event_attach error: {e}")
+            break
+
     def _playlist_watchdog(self):
         """Detect stuck VLC player by checking if playback position progresses."""
         if not self._timers_active:
@@ -709,20 +740,32 @@ class VideoPlayer(BasePlayer):
             if not primary_window:
                 return self._timers_active
 
-            current_pos = primary_window.get_position()
-            if self._is_transitioning:
-                self._last_watchdog_position = current_pos
+            if self._is_transitioning or self._playlist_recovering or not self._should_playback_start():
+                self._last_watchdog_position = -1.0
+                self._playlist_stall_count = 0
                 return self._timers_active
 
-            if current_pos == self._last_watchdog_position and current_pos != -1.0:
+            current_pos = primary_window.get_position()
+            if current_pos == -1.0:
+                self._last_watchdog_position = current_pos
+                self._playlist_stall_count = 0
+                return self._timers_active
+
+            if current_pos == self._last_watchdog_position:
+                self._playlist_stall_count += 1
                 logger.warning(
                     f"[Playlist Watchdog] Player stuck at position {current_pos:.4f} "
-                    f"index={self._playlist_index}, forcing advance"
+                    f"index={self._playlist_index}, stalls={self._playlist_stall_count}"
                 )
-                self._last_watchdog_position = -1.0
-                self._on_playlist_media_end(None)
+                if self._playlist_stall_count == 1:
+                    GLib.idle_add(self._playlist_recover_current, "watchdog")
+                else:
+                    self._playlist_stall_count = 0
+                    self._last_watchdog_position = -1.0
+                    self._on_playlist_media_end(None)
             else:
                 self._last_watchdog_position = current_pos
+                self._playlist_stall_count = 0
         except Exception as e:
             logger.debug(f"[Playlist Watchdog] Error: {e}")
         return self._timers_active
@@ -736,18 +779,19 @@ class VideoPlayer(BasePlayer):
                 try:
                     em = window.get_event_manager()
                     em.event_detach(vlc.EventType.MediaPlayerEndReached)
+                    em.event_detach(vlc.EventType.MediaPlayerEncounteredError)
                 except Exception as e:
                     logger.debug(f"[Playlist] event_detach error (expected during cleanup): {e}")
                 break
         self._playlist_event_attached = False
 
-    def _playlist_play_current(self):
+    def _playlist_play_current(self, recover_players=False):
         """Play the current video in the playlist on all monitors."""
-        playlist = self.config.get(CONFIG_KEY_PLAYLIST, [])
-        if not playlist:
+        video_path = self._get_playlist_video_path()
+        if not video_path:
             return
 
-        video_path = playlist[self._playlist_index]
+        playlist = self.config.get(CONFIG_KEY_PLAYLIST, [])
         repeat_count = self.config.get(CONFIG_KEY_PLAYLIST_REPEAT_COUNT, 1)
         logger.info(f"[Playlist] Playing video {self._playlist_index + 1}/{len(playlist)} (repeat={repeat_count}x): {video_path}")
 
@@ -755,26 +799,20 @@ class VideoPlayer(BasePlayer):
 
         self._detach_playlist_event()
 
-        for monitor, window in self.windows.items():
-            window.replace_vlc_widget()
+        if recover_players:
+            for monitor, window in self.windows.items():
+                logger.warning(f"[Playlist] Recovering player for {monitor.get_model()}")
+                window.recover_vlc_widget()
 
         for monitor, window in self.windows.items():
-            media = window.media_new(video_path)
-            if repeat_count > 1:
-                media.add_option(f":input-repeat={repeat_count - 1}")
-            if not monitor.is_primary():
-                media.add_option("no-audio")
-            window.set_media(media)
+            self._set_playlist_media(monitor, window, video_path, repeat_count)
 
-        for monitor, window in self.windows.items():
-            if monitor.is_primary():
-                em = window.get_event_manager()
-                em.event_attach(vlc.EventType.MediaPlayerEndReached, self._on_playlist_media_end)
-                self._playlist_event_attached = True
-                break
+        self._attach_playlist_events()
 
         self.volume = self.config[CONFIG_KEY_VOLUME]
         self.is_mute = self.config[CONFIG_KEY_MUTE]
+        self._last_watchdog_position = -1.0
+        self._playlist_stall_count = 0
         self.start_playback()
 
         cached = self._playlist_dimensions_cache.get(video_path)
@@ -821,10 +859,18 @@ class VideoPlayer(BasePlayer):
         logger.info(f"[Playlist] MediaEnd #{self._media_end_count} (transitioning={self._is_transitioning})")
         GLib.idle_add(self._playlist_advance)
 
+    def _on_playlist_media_error(self, event):
+        """VLC callback when playback fails. Runs in VLC thread, dispatches recovery to GTK main thread."""
+        logger.warning(f"[Playlist] Media error received (transitioning={self._is_transitioning})")
+        GLib.idle_add(self._playlist_recover_current, "vlc-error")
+
     def _playlist_advance(self):
         """Advance the playlist to the next video (VLC handles repeats via input-repeat)."""
         playlist = self.config.get(CONFIG_KEY_PLAYLIST, [])
         if not playlist:
+            return False
+
+        if self._playlist_recovering:
             return False
 
         self._playlist_index = (self._playlist_index + 1) % len(playlist)
@@ -838,7 +884,7 @@ class VideoPlayer(BasePlayer):
 
     def _playlist_transition_to_next(self):
         """Switch to the next video instantly (no fade effect)."""
-        if self._is_transitioning:
+        if self._is_transitioning or self._playlist_recovering:
             logger.warning("[Playlist] Transition skipped: already transitioning")
             return
         self._transition_count += 1
@@ -852,6 +898,32 @@ class VideoPlayer(BasePlayer):
             logger.error(f"[Playlist] Transition error: {e}", exc_info=True)
         finally:
             self._is_transitioning = False
+
+    def _playlist_recover_current(self, reason):
+        """Recover the current playlist item after VLC stalls or reports an error."""
+        if self._playlist_recovering:
+            logger.warning(f"[Playlist] Recovery skipped: already recovering ({reason})")
+            return False
+
+        self._playlist_recovering = True
+        self._playlist_recovery_count += 1
+        logger.warning(
+            f"[Playlist] Recovery #{self._playlist_recovery_count} starting "
+            f"(reason={reason}, index={self._playlist_index})"
+        )
+
+        try:
+            self._playlist_play_current(recover_players=True)
+            logger.info(
+                f"[Playlist] Recovery #{self._playlist_recovery_count} complete "
+                f"(index={self._playlist_index})"
+            )
+        except Exception as e:
+            logger.error(f"[Playlist] Recovery error: {e}", exc_info=True)
+        finally:
+            self._playlist_recovering = False
+
+        return False
 
 
     def monitor_sync(self):
@@ -940,6 +1012,7 @@ class VideoPlayer(BasePlayer):
 
     def quit_player(self):
         self._timers_active = False
+        self._detach_playlist_event()
         self.set_original_wallpaper()
         
         if self.active_handler:
