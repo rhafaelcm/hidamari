@@ -505,7 +505,8 @@ Videos located in Hidamari folder</property>
                     <property name="can-focus">False</property>
                     <property name="label" translatable="yes">&lt;span size="x-large"&gt;&lt;b&gt;Playlist&lt;/b&gt;&lt;/span&gt;
 Rotate videos on all monitors.
-To add videos, right-click on a video in the Local Video tab.</property>
+To add videos, right-click on a video in the Local Video tab.
+&lt;span size="small"&gt;&lt;i&gt;Note: audio output is disabled in playlist mode to keep PipeWire stable.&lt;/i&gt;&lt;/span&gt;</property>
                     <property name="use-markup">True</property>
                     <property name="xalign">0</property>
                   </object>
