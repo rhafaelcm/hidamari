@@ -263,12 +263,28 @@ class HidamariServer(object):
     def mode(self):
         return self.config[CONFIG_KEY_MODE]
 
+    def _is_audio_disabled_mode(self):
+        """Modes where the player runs without an audio backend.
+
+        In MODE_PLAYLIST the libVLC instance is built with --no-audio
+        --aout=none, so any volume/mute change would only mutate the
+        persisted config without producing sound. Used to short-circuit
+        DBus volume/mute writes coming from the GUI, the systray or any
+        other client.
+        """
+        return self.config.get(CONFIG_KEY_MODE) == MODE_PLAYLIST
+
     @property
     def volume(self):
         return self.config[CONFIG_KEY_VOLUME]
 
     @volume.setter
     def volume(self, volume):
+        if self._is_audio_disabled_mode():
+            logger.debug(
+                "[Server] Ignoring volume change in playlist mode (audio disabled)"
+            )
+            return
         self.config[CONFIG_KEY_VOLUME] = volume
         player = get_instance(DBUS_NAME_PLAYER)
         if player is not None:
@@ -291,6 +307,11 @@ class HidamariServer(object):
 
     @is_mute.setter
     def is_mute(self, is_mute):
+        if self._is_audio_disabled_mode():
+            logger.debug(
+                "[Server] Ignoring mute change in playlist mode (audio disabled)"
+            )
+            return
         self.config[CONFIG_KEY_MUTE] = is_mute
         player = get_instance(DBUS_NAME_PLAYER)
         if player is not None:

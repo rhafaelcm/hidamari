@@ -475,7 +475,9 @@ class ControlPanel(Gtk.Application):
 
         In playlist mode the libVLC Instance is created without aout
         (--no-audio --aout=none), so changing volume/mute has no audible
-        effect - we disable the controls and show an explanatory tooltip.
+        effect - we disable the controls AND the underlying Gio actions to
+        keep the hamburger menu / keyboard accelerators consistent with
+        the greyed-out widgets.
         """
         audio_disabled = self._is_audio_disabled_mode()
         scale = self.builder.get_object("ScaleVolume")
@@ -486,6 +488,12 @@ class ControlPanel(Gtk.Application):
         if toggle_mute is not None:
             toggle_mute.set_sensitive(not audio_disabled)
             toggle_mute.set_tooltip_text(tooltip)
+        # Disable the Gio.SimpleAction itself so any trigger (popover menu
+        # items via app.mute, keyboard accelerators, programmatic
+        # app.activate_action) is blocked - not just clicks on the widget.
+        mute_action = self.lookup_action("mute")
+        if mute_action is not None:
+            mute_action.set_enabled(not audio_disabled)
         self.set_scale_volume_sensitive()
         self.set_mute_toggle_icon()
 
