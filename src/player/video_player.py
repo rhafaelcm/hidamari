@@ -8,6 +8,7 @@ import logging
 import pathlib
 import subprocess
 import threading
+from collections import deque
 from threading import Timer
 
 import gi
@@ -56,6 +57,22 @@ except ModuleNotFoundError:
     from hidamari.yt_utils import get_formats, get_best_audio, get_optimal_video
 
 logger = logging.getLogger(LOGGER_NAME)
+
+# Proactive soft-restart: every N playlist transitions we recreate the libVLC
+# Instance (instead of just swapping the media). Keeps the decoder "breathing"
+# during long sessions and avoids silent state accumulation.
+PLAYLIST_SOFT_RESTART_EVERY = 25
+
+# Circuit breaker for the recovery path: if within a window of N seconds the
+# player performs M or more recoveries, the current video is marked as
+# problematic and the playlist advances instead of trying to recover again.
+PLAYLIST_RECOVERY_WINDOW_SEC = 60.0
+PLAYLIST_RECOVERY_MAX_IN_WINDOW = 3
+
+# Brief synchronous pause (in seconds) between releasing the old Instance and
+# creating the new one in recover_vlc_widget. Gives libVLC time to free the
+# decoder before bringing up a new Instance on the same widget.
+PLAYLIST_RECOVERY_SLEEP_SEC = 0.25
 
 if is_wayland():
     # TODO: Window event monitoring for GNOME Wayland is broken
@@ -120,13 +137,18 @@ class VLCWidget(Gtk.DrawingArea):
     """
     __gtype_name__ = "VLCWidget"
 
-    def __init__(self, width, height):
+    def __init__(self, width, height, disable_audio: bool = False):
         Gtk.DrawingArea.__init__(self)
 
         # Spawn a VLC instance and create a new media player to embed.
         # Some options need to be specified when instantiating VLC.
         # --no-disable-screensaver: Allow screensaver.
         vlc_options = ["--no-disable-screensaver"]
+        if disable_audio:
+            # Fully disable libVLC's audio subsystem, preventing the
+            # PipeWire/PulseAudio module from being loaded. Used in playlist
+            # mode to avoid PipeWire crashes during transitions.
+            vlc_options += ["--no-audio", "--aout=none"]
         self.instance = vlc.Instance(vlc_options)
         self.player = self.instance.media_player_new()
 
@@ -158,12 +180,13 @@ class VLCWidget(Gtk.DrawingArea):
 
 
 class PlayerWindow(Gtk.ApplicationWindow):
-    def __init__(self, name, width, height, *args, **kwargs):
+    def __init__(self, name, width, height, *args, disable_audio: bool = False, **kwargs):
         super(PlayerWindow, self).__init__(*args, **kwargs)
         # Setup a VLC widget given the provided width and height.
         self.width = width
         self.height = height
         self.name = name
+        self._disable_audio = disable_audio
         self.__vlc_widget = None
         self._create_vlc_widget()
 
@@ -179,7 +202,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self.connect("button-press-event", self._on_button_press_event)
 
     def _create_vlc_widget(self):
-        self.__vlc_widget = VLCWidget(self.width, self.height)
+        self.__vlc_widget = VLCWidget(self.width, self.height, disable_audio=self._disable_audio)
         self.add(self.__vlc_widget)
         self.__vlc_widget.show()
 
@@ -399,6 +422,11 @@ class PlayerWindow(Gtk.ApplicationWindow):
         del old_widget
         gc.collect()
 
+        # Brief synchronous block (~250 ms) so libVLC finishes freeing the
+        # decoder before creating the next Instance. Blocking the main thread
+        # for less than half a frame is acceptable and keeps the logic linear.
+        time.sleep(PLAYLIST_RECOVERY_SLEEP_SEC)
+
         self._create_vlc_widget()
 
 
@@ -482,10 +510,23 @@ class VideoPlayer(BasePlayer):
         self._playlist_preload_thread = None
         self._current_recovery_attempts = 0
         self._timers_active = False
+        # Sliding window of recovery timestamps for the circuit breaker.
+        # If too many recoveries happen within PLAYLIST_RECOVERY_WINDOW_SEC,
+        # mark the current video as problematic and advance instead of retrying.
+        self._recovery_timestamps = deque(maxlen=PLAYLIST_RECOVERY_MAX_IN_WINDOW + 5)
 
     def new_window(self, gdk_monitor):
         rect = gdk_monitor.get_geometry()
-        return PlayerWindow(gdk_monitor.get_model(), rect.width, rect.height, application=self)
+        # In playlist mode, create the libVLC Instance without any audio
+        # module (see VLCWidget.__init__) to avoid contact with PipeWire.
+        disable_audio = self.mode == MODE_PLAYLIST
+        return PlayerWindow(
+            gdk_monitor.get_model(),
+            rect.width,
+            rect.height,
+            application=self,
+            disable_audio=disable_audio,
+        )
 
     def do_activate(self):
         super().do_activate()
@@ -807,7 +848,9 @@ class VideoPlayer(BasePlayer):
         if not self._timers_active:
             self._timers_active = True
             GLib.timeout_add_seconds(60, self._playlist_health_check)
-            GLib.timeout_add_seconds(30, self._playlist_watchdog)
+            # Watchdog every 45 s (was 30 s) to reduce false positives on
+            # long videos with variable bitrate.
+            GLib.timeout_add_seconds(45, self._playlist_watchdog)
 
         self._start_playlist_metadata_preload(playlist)
         self._playlist_play_current()
@@ -823,10 +866,21 @@ class VideoPlayer(BasePlayer):
         media = window.media_new(video_path)
         if repeat_count > 1:
             media.add_option(f":input-repeat={repeat_count - 1}")
-        if not monitor.is_primary():
-            media.add_option("no-audio")
+        # Defense in depth: the libVLC Instance was already created with
+        # --no-audio --aout=none in playlist mode (see VLCWidget), but we
+        # still set :no-audio per media to guarantee that, even on an
+        # unexpected code path, no audio track is decoded.
+        media.add_option("no-audio")
         if media_info.get("force_software_decode"):
             media.add_option(":avcodec-hw=none")
+        # Release the previous stream synchronously before switching media.
+        # On a freshly created widget after recovery this is a cheap no-op;
+        # on a normal transition it prevents the player from being left in
+        # an inconsistent state.
+        try:
+            window.stop()
+        except Exception as e:
+            logger.debug(f"[Playlist] stop() before set_media: {e}")
         window.set_media(media)
 
     def _advance_problematic_video(self, reason):
@@ -891,18 +945,34 @@ class VideoPlayer(BasePlayer):
 
             if current_pos == self._last_watchdog_position:
                 self._playlist_stall_count += 1
+                video_path = self._get_playlist_video_path()
+                media_info = self._get_playlist_media_info(video_path) if video_path else {}
+                av1_sw = (
+                    media_info.get("codec_name") == "av1"
+                    and media_info.get("force_software_decode")
+                )
+                # AV1 in SW is known to be more prone to intermittent stalls;
+                # allow one extra stall of tolerance before triggering recovery.
+                recovery_threshold = 3 if av1_sw else 2
                 logger.warning(
                     f"[Playlist Watchdog] Player stuck at position {current_pos:.4f} "
-                    f"index={self._playlist_index}, stalls={self._playlist_stall_count}"
+                    f"index={self._playlist_index}, stalls={self._playlist_stall_count}, "
+                    f"av1_sw={av1_sw}, threshold={recovery_threshold}"
                 )
                 if self._advance_problematic_video("watchdog"):
                     return self._timers_active
-                if self._playlist_stall_count == 1:
-                    GLib.idle_add(self._playlist_recover_current, "watchdog")
+                if self._playlist_stall_count < recovery_threshold:
+                    # Just log and wait for the next watchdog pass.
+                    pass
+                elif self._playlist_stall_count == recovery_threshold:
+                    # First recovery attempt (subject to the circuit breaker).
+                    # Direct synchronous call - we are already on the main thread.
+                    self._playlist_recover_current("watchdog")
                 else:
+                    # Previous recovery did not help; skip to the next video.
                     self._playlist_stall_count = 0
                     self._last_watchdog_position = -1.0
-                    self._on_playlist_media_end(None)
+                    self._playlist_advance()
             else:
                 self._last_watchdog_position = current_pos
                 self._playlist_stall_count = 0
@@ -946,6 +1016,17 @@ class VideoPlayer(BasePlayer):
         self._detach_playlist_event()
 
         if recover_players:
+            # Deterministic cleanup before destroying/recreating the VLCWidget:
+            # - bump the preload generation so in-flight workers stop trying
+            #   to schedule centercrop on widgets that will be swapped out;
+            # - cancel pending fades on every window to avoid calling
+            #   set_volume/set_opacity on players that are already released.
+            self._playlist_preload_generation += 1
+            for window in self.windows.values():
+                if window is None:
+                    continue
+                window.fade.cancel()
+                window.fade_opacity.cancel()
             for monitor, window in self.windows.items():
                 logger.warning(f"[Playlist] Recovering player for {monitor.get_model()}")
                 window.recover_vlc_widget()
@@ -1029,20 +1110,63 @@ class VideoPlayer(BasePlayer):
             return
         self._transition_count += 1
         self._is_transitioning = True
-        logger.info(f"[Playlist] Transition #{self._transition_count} starting (index={self._playlist_index})")
+        soft_restart = (
+            PLAYLIST_SOFT_RESTART_EVERY > 0
+            and self._transition_count % PLAYLIST_SOFT_RESTART_EVERY == 0
+        )
+        if soft_restart:
+            logger.info(
+                f"[Playlist] Soft-restart at transition #{self._transition_count} "
+                f"(every {PLAYLIST_SOFT_RESTART_EVERY})"
+            )
+        else:
+            logger.info(f"[Playlist] Transition #{self._transition_count} starting (index={self._playlist_index})")
 
         try:
-            self._playlist_play_current()
+            self._playlist_play_current(recover_players=soft_restart)
             logger.info(f"[Playlist] Transition #{self._transition_count} complete (index={self._playlist_index})")
         except Exception as e:
             logger.error(f"[Playlist] Transition error: {e}", exc_info=True)
         finally:
             self._is_transitioning = False
 
+    def _circuit_breaker_tripped(self) -> bool:
+        """Record a recovery and report whether the recent limit was reached."""
+        now = time.monotonic()
+        self._recovery_timestamps.append(now)
+        recent = sum(
+            1 for t in self._recovery_timestamps
+            if now - t <= PLAYLIST_RECOVERY_WINDOW_SEC
+        )
+        return recent >= PLAYLIST_RECOVERY_MAX_IN_WINDOW
+
     def _playlist_recover_current(self, reason):
         """Recover the current playlist item after VLC stalls or reports an error."""
         if self._playlist_recovering:
             logger.warning(f"[Playlist] Recovery skipped: already recovering ({reason})")
+            return False
+
+        # Circuit breaker: too many recoveries in a short window -> mark as
+        # problematic and advance, instead of looping. Fully synchronous
+        # path: call _playlist_advance() directly (we are already on the
+        # main thread), avoiding the GLib.idle_add that
+        # _on_playlist_media_end would use.
+        if self._circuit_breaker_tripped():
+            video_path = self._get_playlist_video_path()
+            if video_path:
+                logger.warning(
+                    f"[Playlist] Circuit breaker tripped (reason={reason}, "
+                    f"index={self._playlist_index}); marking {video_path} "
+                    f"problematic and advancing"
+                )
+                self._set_playlist_media_info(
+                    video_path,
+                    mark_playlist_media_info_stalled(self._get_playlist_media_info(video_path)),
+                    save=True,
+                )
+            self._playlist_stall_count = 0
+            self._last_watchdog_position = -1.0
+            self._playlist_advance()
             return False
 
         self._playlist_recovering = True

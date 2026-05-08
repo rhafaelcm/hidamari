@@ -415,6 +415,7 @@ class ControlPanel(Gtk.Application):
         print(video_path, monitor.name)
         if self.server is not None:
             self.server.video(video_path, monitor.name)
+        self.set_audio_controls_for_mode()
 
     def on_local_web_page_apply(self, *_):
         file_chooser: Gtk.FileChooserButton = self.builder.get_object("FileChooser")
@@ -429,6 +430,7 @@ class ControlPanel(Gtk.Application):
         self._save_config()
         if self.server is not None:
             self.server.webpage(choose.get_path())
+        self.set_audio_controls_for_mode()
 
     def on_play_pause(self, *_):
         if self.server is None:
@@ -444,10 +446,14 @@ class ControlPanel(Gtk.Application):
         if self.server is not None:
             self.server.feeling_lucky()
 
+    def _is_audio_disabled_mode(self) -> bool:
+        """Modes where the player does not access the audio subsystem (e.g. playlist)."""
+        return self.config.get(CONFIG_KEY_MODE) == MODE_PLAYLIST
+
     def set_mute_toggle_icon(self):
         toggle_icon: Gtk.Image = self.builder.get_object("ToggleMuteIcon")
         volume, is_mute = self.config[CONFIG_KEY_VOLUME], self.config[CONFIG_KEY_MUTE]
-        if volume == 0 or is_mute:
+        if self._is_audio_disabled_mode() or volume == 0 or is_mute:
             icon_name = "audio-volume-muted-symbolic"
         elif volume < 30:
             icon_name = "audio-volume-low-symbolic"
@@ -459,10 +465,29 @@ class ControlPanel(Gtk.Application):
 
     def set_scale_volume_sensitive(self):
         scale = self.builder.get_object("ScaleVolume")
-        if self.config[CONFIG_KEY_MUTE]:
+        if self._is_audio_disabled_mode() or self.config[CONFIG_KEY_MUTE]:
             scale.set_sensitive(False)
         else:
             scale.set_sensitive(True)
+
+    def set_audio_controls_for_mode(self):
+        """Reflect the current mode in the audio controls (volume + mute).
+
+        In playlist mode the libVLC Instance is created without aout
+        (--no-audio --aout=none), so changing volume/mute has no audible
+        effect - we disable the controls and show an explanatory tooltip.
+        """
+        audio_disabled = self._is_audio_disabled_mode()
+        scale = self.builder.get_object("ScaleVolume")
+        toggle_mute = self.builder.get_object("ToggleMute")
+        tooltip = "Audio is disabled in playlist mode" if audio_disabled else None
+        if scale is not None:
+            scale.set_tooltip_text(tooltip)
+        if toggle_mute is not None:
+            toggle_mute.set_sensitive(not audio_disabled)
+            toggle_mute.set_tooltip_text(tooltip)
+        self.set_scale_volume_sensitive()
+        self.set_mute_toggle_icon()
 
     def set_spin_blur_radius_sensitive(self):
         spin = self.builder.get_object("SpinBlurRadius")
@@ -578,6 +603,7 @@ class ControlPanel(Gtk.Application):
         self._save_config()
         if self.server is not None:
             self.server.stream(url)
+        self.set_audio_controls_for_mode()
 
     def on_web_page_activate(self, entry: Gtk.Entry, *_):
         url = entry.get_text()
@@ -589,6 +615,7 @@ class ControlPanel(Gtk.Application):
         self._save_config()
         if self.server is not None:
             self.server.webpage(url)
+        self.set_audio_controls_for_mode()
     
     def on_icon_view_button_press(self, widget, event):
         if event.button == Gdk.BUTTON_SECONDARY:  # Right click
@@ -614,8 +641,7 @@ class ControlPanel(Gtk.Application):
     def _reload_all_widgets(self):
         self._reload_icon_view()
         self._setup_playlist_tab()
-        self.set_mute_toggle_icon()
-        self.set_scale_volume_sensitive()
+        self.set_audio_controls_for_mode()
         self.set_spin_blur_radius_sensitive()
         toggle_mute: Gtk.ToggleButton = self.builder.get_object("ToggleMute")
         toggle_mute.set_state = self.config[CONFIG_KEY_MUTE]
@@ -794,6 +820,7 @@ class ControlPanel(Gtk.Application):
         if self.server is not None:
             playlist_json = json.dumps(self._playlist_paths)
             self.server.playlist(playlist_json, repeat_count)
+        self.set_audio_controls_for_mode()
 
     def _reload_icon_view(self, *_):
         self.video_paths = get_video_paths()
